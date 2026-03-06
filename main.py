@@ -30,7 +30,7 @@ from core.logging import get_logger
 from core.market_calendar import is_market_open
 from data.db import init_db, get_session
 from data.ingestion import ingest_daily
-from decision.engine import run_decision_engine
+from decision.engine import run_decision_engine, run_daily_decision_engine
 from execution.paper import execute_paper_decisions
 from capital.manager import get_or_create_portfolio, save_portfolio_snapshot
 from data.feature_store import get_price_history
@@ -84,7 +84,12 @@ def run_daily_ingestion():
 
 
 def run_signal_and_decision():
-    """Scheduled job: run signal scoring and decision engine."""
+    """
+    Scheduled job: run signal scoring and decision engine.
+
+    Mon-Thu: daily scan — exit losers with 3m breakdown, fill replacements
+    Friday:  weekly rebalance — full re-rank with new position sizing
+    """
     global _pending_decisions
 
     if check_kill_switch():
@@ -94,14 +99,25 @@ def run_signal_and_decision():
         logger.info("Market closed today (holiday) — skipping signals")
         return
 
-    logger.info("Running scheduled signal scoring + decision engine")
+    from datetime import datetime as dt
+    weekday = dt.now().weekday()  # 0=Mon, 4=Fri
+    is_rebalance_day = weekday == 4
+
+    if is_rebalance_day:
+        logger.info("Running WEEKLY rebalance (Friday)")
+        engine_fn = run_decision_engine
+    else:
+        logger.info("Running DAILY scan (Mon-Thu)")
+        engine_fn = run_daily_decision_engine
+
     try:
-        decisions = run_decision_engine()
+        decisions = engine_fn()
         _pending_decisions = decisions
         logger.info(
             "Scheduled decision engine complete",
             extra={
                 "extra_data": {
+                    "mode": "weekly_rebalance" if is_rebalance_day else "daily_scan",
                     "decision_count": len(decisions),
                     "summary": [
                         {"symbol": d["symbol"], "action": d["action"]}
