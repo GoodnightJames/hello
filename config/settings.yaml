@@ -1,5 +1,14 @@
-# Trading Engine Settings — v1.0
+# Trading Engine Settings — v2.0 (Small-Account Accumulation Mode)
 # All timing in US/Eastern
+#
+# ACCOUNT MODEL: $0 start, $100/week deposits. No lump sum.
+# The weekly deposit IS the capital. Deploy it aggressively.
+
+account:
+  mode: accumulation               # "accumulation" (DCA $100/wk) or "lump_sum" ($100k paper)
+  initial_capital: 0.0              # Starting with nothing
+  weekly_deposit: 100.0             # Core capital input
+  deposit_day: monday               # When the $100 lands
 
 universe:
   equities:
@@ -40,9 +49,9 @@ schedule:
   close_sync: "16:00"
 
 rebalance:
-  strategy_rebalance: monthly
+  strategy_rebalance: weekly        # Rebalance weekly to align with deposits
   equal_weight_rebalance: quarterly
-  drift_threshold: 0.10  # 10% drift triggers rebalance
+  drift_threshold: 0.05             # 5% drift — tighter since account is small
 
 database:
   url: "sqlite:///trading.db"

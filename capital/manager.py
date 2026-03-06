@@ -1,11 +1,15 @@
 """
-Capital Manager — portfolio state tracking and allocation.
+Capital Manager — portfolio state tracking for small-account accumulation.
+
+ACCOUNT MODEL: $0 start, $100/week deposits.
+The weekly deposit IS the capital. There is no lump sum.
 
 Responsibilities:
 1. Track portfolio state (cash, equity, positions) in database
-2. Calculate allocation amounts per strategy
-3. Handle weekly deposits
-4. Provide portfolio state to decision and risk engines
+2. Track total amount deposited vs current value (the key metric)
+3. Handle weekly deposits as the primary capital event
+4. Calculate allocation — deploy almost all available cash
+5. Provide portfolio state to decision and risk engines
 
 This module is the source of truth for "how much capital is available."
 The broker is used for reconciliation only.
@@ -14,13 +18,34 @@ The broker is used for reconciliation only.
 import json
 from datetime import datetime
 
+import yaml
+
 from core.logging import get_logger
 from data.db import PortfolioState, Deposit, get_session, init_db
 
 logger = get_logger("capital.manager")
 
-# Default initial capital for paper trading (matches Alpaca paper account)
-DEFAULT_INITIAL_CAPITAL = 100_000.0
+
+def _load_account_config():
+    """Load account settings from settings.yaml."""
+    try:
+        with open("config/settings.yaml", "r") as f:
+            settings = yaml.safe_load(f)
+        return settings.get("account", {})
+    except Exception:
+        return {}
+
+
+def get_initial_capital():
+    """Get initial capital from config. Defaults to 0 for accumulation mode."""
+    config = _load_account_config()
+    return config.get("initial_capital", 0.0)
+
+
+def get_weekly_deposit_amount():
+    """Get weekly deposit amount from config. Defaults to $100."""
+    config = _load_account_config()
+    return config.get("weekly_deposit", 100.0)
 
 
 def get_latest_portfolio_state(session):
@@ -55,15 +80,18 @@ def initialize_portfolio(session, initial_capital=None):
     """
     Create the initial portfolio state (first run or reset).
 
+    For accumulation mode, this starts at $0. The first deposit
+    is what kicks things off.
+
     Args:
         session: DB session.
-        initial_capital: Starting cash amount.
+        initial_capital: Starting cash amount. Defaults to config value (0 for accumulation).
 
     Returns:
         Portfolio state dict.
     """
     if initial_capital is None:
-        initial_capital = DEFAULT_INITIAL_CAPITAL
+        initial_capital = get_initial_capital()
 
     state = PortfolioState(
         date=datetime.utcnow(),
@@ -76,7 +104,7 @@ def initialize_portfolio(session, initial_capital=None):
 
     logger.info(
         "Portfolio initialized",
-        extra={"extra_data": {"initial_capital": initial_capital}},
+        extra={"extra_data": {"initial_capital": initial_capital, "mode": "accumulation"}},
     )
 
     return {
@@ -149,7 +177,51 @@ def save_portfolio_snapshot(session, cash, positions, prices=None):
     }
 
 
-def record_deposit(session, amount, notes=None, mode_params=None):
+def get_total_deposited(session):
+    """
+    Calculate total amount deposited across all time.
+
+    This is THE key metric for accumulation mode:
+    total_deposited vs current_equity = your actual return.
+
+    Returns:
+        Float — total dollars deposited.
+    """
+    deposits = session.query(Deposit).all()
+    return sum(d.amount for d in deposits)
+
+
+def get_accumulation_summary(session):
+    """
+    Get a summary of the accumulation account's performance.
+
+    Returns:
+        Dict with:
+        - total_deposited: total $ put in
+        - current_equity: what it's worth now
+        - gain_loss: dollar gain/loss
+        - gain_loss_pct: percentage return on invested capital
+        - weeks_active: number of deposits made
+    """
+    total_deposited = get_total_deposited(session)
+    state = get_latest_portfolio_state(session)
+    current_equity = state["total_equity"] if state else 0.0
+
+    gain_loss = current_equity - total_deposited
+    gain_loss_pct = (gain_loss / total_deposited * 100) if total_deposited > 0 else 0.0
+
+    deposit_count = session.query(Deposit).count()
+
+    return {
+        "total_deposited": total_deposited,
+        "current_equity": current_equity,
+        "gain_loss": gain_loss,
+        "gain_loss_pct": round(gain_loss_pct, 2),
+        "weeks_active": deposit_count,
+    }
+
+
+def record_deposit(session, amount=None, notes=None, mode_params=None):
     """
     Record a cash deposit (weekly $100 per spec).
 
@@ -160,7 +232,7 @@ def record_deposit(session, amount, notes=None, mode_params=None):
 
     Args:
         session: DB session.
-        amount: Deposit amount.
+        amount: Deposit amount. Defaults to weekly_deposit from config.
         notes: Optional notes.
         mode_params: Optional dict from performance.manager.get_mode_params().
                      When deploy_deposits is False, deposit goes to cash
@@ -169,6 +241,9 @@ def record_deposit(session, amount, notes=None, mode_params=None):
     Returns:
         Updated portfolio state dict.
     """
+    if amount is None:
+        amount = get_weekly_deposit_amount()
+
     deploy = True
     if mode_params and not mode_params.get("deploy_deposits", True):
         deploy = False
@@ -189,6 +264,8 @@ def record_deposit(session, amount, notes=None, mode_params=None):
         new_cash = current["cash"] + amount
         current = save_portfolio_snapshot(session, new_cash, current["positions"])
 
+    total_deposited = get_total_deposited(session)
+
     logger.info(
         "Deposit recorded",
         extra={
@@ -197,6 +274,8 @@ def record_deposit(session, amount, notes=None, mode_params=None):
                 "deployed": deploy,
                 "new_cash": current["cash"],
                 "new_equity": current["total_equity"],
+                "total_deposited": total_deposited,
+                "weeks_active": session.query(Deposit).count(),
             }
         },
     )
@@ -207,9 +286,12 @@ def calculate_strategy_allocation(portfolio_state, strategy_capital_pct):
     """
     Calculate the dollar amount available for a strategy.
 
+    For accumulation mode, this is almost all available cash —
+    the whole point is to get money deployed, not sitting idle.
+
     Args:
         portfolio_state: Portfolio state dict.
-        strategy_capital_pct: Strategy's allocation percentage (e.g., 0.60).
+        strategy_capital_pct: Strategy's allocation percentage (e.g., 0.95).
 
     Returns:
         Float — dollar amount allocated to the strategy.
@@ -228,6 +310,25 @@ def calculate_strategy_allocation(portfolio_state, strategy_capital_pct):
         },
     )
     return allocation
+
+
+def get_deployable_cash(portfolio_state):
+    """
+    Get the amount of cash available to deploy right now.
+
+    For small accounts, this is basically all the cash minus a tiny buffer
+    to avoid rounding issues with fractional shares.
+
+    Args:
+        portfolio_state: Portfolio state dict.
+
+    Returns:
+        Float — deployable cash amount.
+    """
+    cash = portfolio_state.get("cash", 0)
+    # Keep $1 buffer to avoid zero-balance issues
+    buffer = min(1.0, cash * 0.05)
+    return max(0, cash - buffer)
 
 
 def update_position(session, symbol, qty_change, price, current_state):

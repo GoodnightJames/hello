@@ -1,13 +1,18 @@
-# Dual Momentum / Trend Core Strategy — v1.0.0
+# Dual Momentum / Trend Core Strategy — v2.0.0 (Small-Account Accumulation)
 # Academic basis: Antonacci (2014) Dual Momentum
-# 17.4% CAGR, Sharpe 0.87, max drawdown 22.7% (1974-2013)
+#
+# KEY CHANGE: allocation.capital_pct raised from 60% to 95%.
+# With $100/week, holding 40% in cash is a waste. Deploy almost everything.
+# The safety net is the regime filter and the momentum signal itself —
+# when momentum is negative, we rotate to bonds, not cash.
 
-version: "1.0.0"
+version: "2.0.0"
 name: dual_momentum_trend_core
 description: >
   Dual momentum with absolute and relative momentum signals.
   Holds the highest-ranked asset when absolute momentum is positive,
-  otherwise rotates to cash proxy (SHY).
+  otherwise rotates to safe assets (AGG/SHY). Tuned for small
+  accumulation accounts deploying $100/week.
 
 instruments:
   risk_assets:
@@ -25,13 +30,14 @@ signals:
 
 regime_filter:
   enabled: true
-  indicator: spy_200d_sma         # Hold cash when SPY below 200-day SMA
+  indicator: spy_200d_sma         # Hold safe assets when SPY below 200-day SMA
   reference_symbol: SPY
 
 allocation:
-  capital_pct: 0.60               # 60% of total portfolio
+  capital_pct: 0.95               # 95% of portfolio (was 60% — can't afford idle cash)
+  min_trade_dollars: 1.00         # Alpaca supports fractional shares down to $1
 
 rebalance:
-  frequency: monthly
-  expected_turnover: "1-2 trades per month"
-  typical_holding_period: "1-6 months"
+  frequency: weekly               # Weekly to align with deposit cadence (was monthly)
+  expected_turnover: "1-2 trades per week"
+  typical_holding_period: "1-4 weeks"

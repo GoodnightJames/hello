@@ -241,10 +241,14 @@ def _execute_alpaca_buy(session, decision, portfolio, prices, risk_result):
             "reason": "No price data available for sizing",
         }
 
-    # Calculate allocation
-    strategy_allocation = portfolio["cash"] * 0.90  # Keep 10% cash buffer
-    max_trade = risk_result.get("max_trade_size", strategy_allocation)
-    allocation = min(strategy_allocation, max_trade) * multiplier
+    # Calculate allocation — deploy almost all available cash
+    # For small accounts ($100/week), sitting in cash is the biggest risk.
+    # max_trade_size from risk enforcer already reflects the risk mode's
+    # deployment percentage (50%/90%/95% of cash).
+    from capital.manager import get_deployable_cash
+    deployable = get_deployable_cash(portfolio)
+    max_trade = risk_result.get("max_trade_size", deployable)
+    allocation = min(deployable, max_trade) * multiplier
 
     shares = calculate_shares(allocation, price)
     if shares <= 0:

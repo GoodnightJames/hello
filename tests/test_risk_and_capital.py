@@ -44,19 +44,19 @@ def risk_params():
 
 class TestMaxTradeSize:
     def test_500_portfolio(self, risk_params):
-        # 1% of $500 = $5.00
+        # 90% of $500 = $450 (deploy almost all cash)
         result = calculate_max_trade_size(risk_params, 500)
-        assert result == pytest.approx(5.00)
+        assert result == pytest.approx(450.00)
 
     def test_1000_portfolio(self, risk_params):
-        # 1% of $1000 = $10.00
+        # 90% of $1000 = $900
         result = calculate_max_trade_size(risk_params, 1000)
-        assert result == pytest.approx(10.00)
+        assert result == pytest.approx(900.00)
 
-    def test_100k_portfolio(self, risk_params):
-        # 1% of $100,000 = $1,000
-        result = calculate_max_trade_size(risk_params, 100_000)
-        assert result == pytest.approx(1000.00)
+    def test_cash_based_sizing(self, risk_params):
+        # When cash is provided, size from cash not equity
+        result = calculate_max_trade_size(risk_params, 10000, cash=100)
+        assert result == pytest.approx(90.00)  # 90% of $100 cash
 
     def test_zero_equity(self, risk_params):
         result = calculate_max_trade_size(risk_params, 0)
@@ -166,10 +166,11 @@ class TestValidateOrder:
 
     def test_buy_approved_when_clean(self, session, risk_params):
         decision = {"symbol": "SPY", "action": "BUY"}
-        state = {"total_equity": 1000}
+        state = {"total_equity": 1000, "cash": 200}
         result = validate_order(session, risk_params, decision, state)
         assert result["approved"] is True
-        assert result["max_trade_size"] == pytest.approx(10.0)
+        # 90% of $200 cash = $180
+        assert result["max_trade_size"] == pytest.approx(180.0)
 
     def test_kill_switch_blocks(self, session, risk_params):
         os.environ["KILL_SWITCH"] = "true"

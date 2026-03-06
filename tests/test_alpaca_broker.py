@@ -276,7 +276,7 @@ class TestGoLiveReadiness:
         from status import check_go_live_readiness
 
         trade_stats = {"total_trades": 15, "days_active": 35}
-        equity_history = {"drawdown_pct": 12.0, "snapshots": 30}
+        equity_history = {"drawdown_pct": 16.0, "snapshots": 30}  # Over 15% limit
         risk_events = []
 
         result = check_go_live_readiness(None, trade_stats, equity_history, risk_events)
@@ -292,6 +292,7 @@ class TestGoLiveReadiness:
             {"type": "daily_loss_limit", "severity": "CRITICAL", "date": "2026-03-01"},
             {"type": "daily_loss_limit", "severity": "CRITICAL", "date": "2026-03-05"},
             {"type": "daily_loss_limit", "severity": "CRITICAL", "date": "2026-03-10"},
+            {"type": "daily_loss_limit", "severity": "CRITICAL", "date": "2026-03-12"},
         ]
 
         result = check_go_live_readiness(None, trade_stats, equity_history, risk_events)

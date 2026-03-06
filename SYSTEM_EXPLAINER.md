@@ -2,35 +2,46 @@
 
 This document explains the same system at three levels. Pick the one that matches your comfort with tech.
 
+**The plan:** Start from $0. Put in $100 every week. Let the system invest it automatically. Get rich or go broke.
+
 ---
 
 ## Level 1: For Anyone (No Tech Background)
 
 ### What does it do?
 
-This is an automated investment system. Instead of a person sitting at a computer deciding what to buy and sell every day, this software does it automatically based on rules we wrote in advance.
+Every week, $100 goes into a brokerage account. This software automatically decides what to buy with that $100 — no human decision-making involved. It checks prices every day and follows strict rules about what to invest in.
 
 ### How does it pick what to buy?
 
 It follows a well-known strategy called **Dual Momentum**, published by Gary Antonacci in 2014. The idea is simple:
 
-1. **Is the stock market going up overall?** If yes, invest. If no, move money to safe bonds.
+1. **Is the stock market going up overall?** If yes, invest the $100 into stocks. If no, put it in safe bonds until things improve.
 2. **Which stocks are going up the fastest?** Buy the ones with the strongest upward trend.
 
-That's it. No AI guessing. No "hot tips." Just a disciplined, mechanical process that checks prices once a day and acts accordingly.
+That's it. No AI guessing. No "hot tips." Just a disciplined, mechanical process that checks prices once a day and invests each week's deposit into whatever has the best momentum.
+
+### How much money are we talking about?
+
+- **Week 1:** $100 invested
+- **Month 1:** ~$400 invested
+- **Year 1:** ~$5,200 invested
+- **Year 5:** ~$26,000 deposited — but if the strategy works, the investments grow too
+
+The magic is **compounding** — early gains get reinvested alongside new deposits, so the pile grows faster over time.
 
 ### What keeps it safe?
 
-The system has multiple safety nets, similar to circuit breakers in your house:
+The system has safety nets, but they're calibrated for a small account:
 
-- **Daily loss limit** — If it loses more than 2% in a single day ($2,000 on a $100k account), it stops trading for the rest of the day.
-- **Weekly loss limit** — If losses hit 5% in a week, it enters review mode.
+- **Daily loss limit** — If it loses more than 5% in a single day, it stops trading for the rest of the day. On a $500 account, that's $25 — not catastrophic.
+- **Weekly loss limit** — If losses hit 10% in a week, it enters review mode.
 - **Emergency off switch** — We can shut it all down instantly with one command.
-- **Paper trading first** — It runs with fake money for at least 30 days before any real money is used. It must pass 5 safety checks before going live.
+- **Paper trading first** — It runs with simulated money for at least 3 weeks to prove it works before real money is used.
 
 ### What's the goal?
 
-Build a system that trades with discipline no human can match — no fear, no greed, no "I have a feeling about this stock." Just rules, executed consistently.
+Build a system that invests $100/week with discipline no human can match — no fear, no greed, no "I have a feeling about this stock." Just rules, executed consistently, every single week.
 
 ---
 
@@ -38,7 +49,7 @@ Build a system that trades with discipline no human can match — no fear, no gr
 
 ### Architecture at a Glance
 
-The system runs as a Python application on a scheduled daily loop. It connects to the Alpaca brokerage API for paper trading (simulated trades with real market prices).
+The system runs as a Python application on a scheduled daily loop. It connects to the Alpaca brokerage API for paper trading (simulated trades with real market prices). It's built around a **$100/week deposit cadence** — every dollar gets deployed.
 
 **Daily pipeline (Mon–Fri):**
 
@@ -46,58 +57,61 @@ The system runs as a Python application on a scheduled daily loop. It connects t
 |-----------|------|--------------|
 | 8:00 AM | Data Ingestion | Pulls 1 year of daily price data (open, high, low, close, volume) for 31 instruments |
 | 8:30 AM | Signal Generation | Computes 12-month momentum scores, classifies market regime, generates BUY/SELL/HOLD signals |
-| 9:25 AM | Execution | Validates signals against risk limits, submits market orders, confirms fills |
+| 9:25 AM | Execution | Validates signals against risk limits, deploys available cash into best signal |
 | 4:00 PM | End-of-Day Sync | Reconciles portfolio with broker, records daily snapshot |
 | Sunday 10 AM | Weekly Report | Summarizes performance, flags risk events |
 
-### Strategy: Dual Momentum
+### Strategy: Dual Momentum + DCA
 
-The system trades a universe of ETFs across US equities, international equities, bonds, and commodities.
+The core strategy is DCA (dollar-cost averaging) $100/week with a momentum tilt. Instead of blindly buying SPY every week, the system picks the best asset based on momentum.
 
 **Decision logic:**
 
 1. Compute 12-month return for each risk asset (SPY, QQQ, etc.)
 2. Compare each to SHY (short-term treasuries) — this is the **absolute momentum** check
 3. If an asset's return beats SHY, it has positive momentum
-4. Rank all passing assets by return — the top one gets the allocation (**relative momentum**)
-5. If nothing beats SHY, rotate entirely to bonds (AGG/SHY)
+4. Rank all passing assets by return — the top one gets the weekly deposit (**relative momentum**)
+5. If nothing beats SHY, rotate entirely to bonds (AGG/SHY) — the money still gets deployed, just into safety
 
 **Regime filter overlay:**
-- If SPY is below its 200-day moving average → risk-off, no new buys
+- If SPY is below its 200-day moving average → risk-off, no new equity buys
 - If VIX is above 30 → reduce position sizes by 50%
 - Both conditions active → reduce to 25%
 
-### Risk Management
+### Risk Management (Tuned for Small Accounts)
 
-Three dynamic risk modes based on recent performance:
+Traditional risk limits (1% per trade) don't work on $400. The system uses **cash deployment percentages** instead:
 
-| Mode | When it activates | Risk per trade | Max positions |
-|------|-------------------|---------------|---------------|
-| Conservative | Drawdown ≥ 5% or 4+ consecutive losses | 0.5% | 3 |
-| Normal | Default state | 1.0% | 5 |
-| Aggressive | Sustained 8%+ returns with <4% drawdown | 1.5% | 6 |
+| Mode | When it activates | Cash deployed per trade | Max positions |
+|------|-------------------|------------------------|---------------|
+| Conservative | Drawdown ≥ 10% or 5+ consecutive losses | 50% of cash | 2 |
+| Normal | Default state | 90% of cash | 3 |
+| Aggressive | 5%+ returns with <6% drawdown | 95% of cash | 4 |
 
-Hard limits that cannot be overridden:
-- 2% max daily loss → automatic shutdown
-- 5% max weekly drawdown → review mode
-- 3 consecutive losses → halt
-- 8 trades/week maximum (prevents overtrading)
-- Kill switch environment variable for emergency stop
+Hard limits:
+- 5% max daily loss → automatic shutdown
+- 10% max weekly drawdown → review mode
+- 5 consecutive losses → halt
+- 6 trades/week maximum
+- Kill switch for emergency stop
+
+These are deliberately wider than institutional limits because a 10% drawdown on $500 is $50 — two bad lunches, not a crisis.
 
 ### Go-Live Criteria
 
 The system must pass ALL of these in paper trading before real money:
-- 30+ days of operation
-- 10+ round-trip trades completed
-- Max drawdown under 10%
-- Win rate above 40%
+- 21+ days of operation (3 weeks)
+- 6+ trades completed
+- Max drawdown under 15%
+- Win rate above 35% (momentum wins big, not often)
 - Profit factor ≥ 1.0 (gross profits exceed gross losses)
 
-### Capital
+### Capital Model
 
-- Starting paper account: $100,000
-- Weekly simulated deposits: $100
-- Current allocation: 60% to strategy, 40% cash reserve
+- **Starting capital: $0** (no lump sum)
+- **Weekly deposit: $100** (this IS the strategy)
+- **Allocation: 95%** to strategy, 5% cash buffer
+- **Key metric: total deposited vs current value** — that's the only number that matters
 
 ---
 
@@ -229,6 +243,21 @@ Alpaca API  ─→  ingestion.py  ─→  SQLite (DailyBar table)
 - `ParamVersion` — Strategy config change log
 - `Deposit` — Capital inflow tracking
 
+### Key Config Changes for Accumulation Mode
+
+The system was originally designed for a $100k paper trading account. Here's what changed:
+
+| Parameter | Old ($100k) | New ($100/wk) | Why |
+|-----------|-------------|---------------|-----|
+| `initial_capital` | $100,000 | $0 | No lump sum |
+| `allocation.capital_pct` | 60% | 95% | Can't afford idle cash |
+| `risk_per_trade_pct` | 1% of equity | 90% of cash | Deploy the deposit |
+| `max_daily_loss` | 2% | 5% | $10 on $200 is noise |
+| `max_weekly_drawdown` | 5% | 10% | Same reason |
+| `consecutive_loss_shutdown` | 3 | 5 | More room on small $ |
+| `rebalance` | Monthly | Weekly | Align with deposit cadence |
+| `go_live min_days` | 30 | 21 | Faster feedback loop |
+
 ### Running It
 
 ```bash
@@ -241,7 +270,7 @@ cp .env.example .env   # Add Alpaca API keys
 # Run the scheduler (stays alive, fires jobs on cron schedule)
 python main.py
 
-# Check system status
+# Check system status (shows deposited vs current value)
 python status.py
 ```
 
@@ -255,4 +284,4 @@ python status.py
 
 ---
 
-*Document generated from the codebase at commit HEAD. For questions, review the config files in `config/` — they're heavily commented and serve as the system's specification.*
+*Document generated from the codebase. Account model: $0 start, $100/week deposits, get rich or go broke. For questions, review the config files in `config/` — they're heavily commented and serve as the system's specification.*

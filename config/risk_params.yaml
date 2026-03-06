@@ -1,77 +1,83 @@
-# Risk Parameters — v2.0 ($100k paper trading account)
-# These values are hard limits enforced by the risk engine.
-# The risk engine overrides every other module.
+# Risk Parameters — v3.0 (Small-Account Accumulation Mode)
+#
+# CONTEXT: $0 start, $100/week deposits. Total capital grows slowly.
+# A 50% drawdown on $400 = $200 = two weeks of deposits.
+# The real risk isn't losing money — it's not being invested.
+#
+# These limits are tuned so the system actually TRADES with small amounts
+# instead of being paralyzed by percentage-based limits designed for $100k.
 
 position_limits:
-  max_risk_per_trade: 0.01          # 1% of portfolio per trade (overridden by risk_mode)
-  max_concurrent_positions: 5       # (overridden by risk_mode)
-  averaging_down: false             # NEVER — hard rule
+  max_risk_per_trade: 0.90          # Deploy up to 90% of available cash per trade
+  max_concurrent_positions: 3       # Keep it focused — small account can't diversify much
+  averaging_down: false             # NEVER — hard rule (same as before)
 
 daily_limits:
-  max_daily_loss: 0.02              # 2% — triggers shutdown ($2,000 on $100k)
-  max_weekly_drawdown: 0.05         # 5% — triggers review ($5,000 on $100k)
+  max_daily_loss: 0.05              # 5% daily — loose enough for real market moves on small $
+  max_weekly_drawdown: 0.10         # 10% weekly — $50 on a $500 account, not catastrophic
 
 shutdown_rules:
-  consecutive_loss_shutdown: 3      # 3 losses in a row — halt trading
+  consecutive_loss_shutdown: 5      # 5 losses in a row (was 3 — too tight for small account)
 
 regime_throttles:
-  vix_threshold: 30                 # VIX > 30 triggers throttle
-  vix_position_reduce: 0.50         # Reduce position size by 50%
-  spy_below_200d_reduce: 0.50       # Reduce position size by 50%
+  vix_threshold: 30                 # VIX > 30 triggers throttle (unchanged)
+  vix_position_reduce: 0.50         # Reduce position size by 50% (unchanged)
+  spy_below_200d_reduce: 0.50       # Reduce position size by 50% (unchanged)
 
 kill_switch:
-  env_var: KILL_SWITCH              # Set to "true" in .env to halt all execution
-  description: "File-based kill switch — halts all execution when activated"
+  env_var: KILL_SWITCH
+  description: "Emergency halt — set to 'true' in .env to stop all trading"
 
 # ─── Performance-Based Risk Modes ───────────────────────────────────────────
-# The performance manager selects a mode based on rolling equity performance.
-# The risk enforcer uses the active mode to override position_limits above.
+# For a small accumulation account, the modes control HOW MUCH of each
+# weekly deposit gets deployed, not percentage-of-equity risk.
+#
+# "risk_per_trade_pct" now means "fraction of available cash to deploy"
+# since the whole point is to get $100/week into the market.
 
 risk_modes:
   conservative:
-    risk_per_trade_pct: 0.005       # 0.5% risk per trade ($500 on $100k)
-    max_positions: 3
-    deploy_deposits: false          # Hold deposits in cash buffer
+    risk_per_trade_pct: 0.50        # Deploy 50% of cash (hold rest as buffer)
+    max_positions: 2
+    deploy_deposits: false          # Hold new deposits in cash until regime improves
 
   normal:
-    risk_per_trade_pct: 0.01        # 1.0% risk per trade ($1,000 on $100k)
-    max_positions: 5
-    deploy_deposits: true           # Deploy deposits normally
+    risk_per_trade_pct: 0.90        # Deploy 90% of cash (keep $10 buffer on $100)
+    max_positions: 3
+    deploy_deposits: true           # Deploy deposits immediately into best signal
 
   aggressive:
-    risk_per_trade_pct: 0.015       # 1.5% risk per trade ($1,500 on $100k)
-    max_positions: 6
-    deploy_deposits: true           # Deploy deposits immediately
+    risk_per_trade_pct: 0.95        # Deploy 95% of cash
+    max_positions: 4
+    deploy_deposits: true           # Deploy immediately
 
 # Thresholds for mode transitions
 mode_transitions:
-  # Upgrade to aggressive
   aggressive_trigger:
-    min_rolling_return: 0.08        # 8% gain over lookback window
-    max_drawdown: 0.04              # Drawdown must be under 4%
-    lookback_days: 60               # 60 trading days
+    min_rolling_return: 0.05        # 5% gain (was 8% — lower bar for small account)
+    max_drawdown: 0.06              # Drawdown under 6% (was 4% — more realistic)
+    lookback_days: 30               # 30 days (was 60 — faster reaction for small account)
 
-  # Downgrade to conservative
   conservative_trigger:
-    max_drawdown: 0.05              # 5% drawdown triggers conservative
-    max_consecutive_losses: 4       # 4 consecutive losing trades
+    max_drawdown: 0.10              # 10% drawdown (was 5% — $50 on $500 isn't scary)
+    max_consecutive_losses: 5       # 5 losses (was 4)
 
-  # Return to normal (from either direction)
   normal_trigger:
     min_rolling_return: 0.0         # Positive returns
-    max_drawdown: 0.05              # Drawdown under 5%
-    min_days_in_mode: 10            # Stay in mode at least 10 trading days
+    max_drawdown: 0.10              # Drawdown under 10%
+    min_days_in_mode: 5             # 5 days (was 10 — faster transitions for small account)
 
-# Trade frequency limit — prevents overtrading in noisy markets
+# Trade frequency — more permissive for weekly rebalancing
 trade_throttle:
-  max_trades_per_week: 8
+  max_trades_per_week: 6            # Was 8, but with 3 max positions this is plenty
 
-# ─── 30-Day Go-Live Criteria ─────────────────────────────────────────────────
-# These thresholds must ALL be met before switching to real money.
+# ─── Go-Live Criteria ─────────────────────────────────────────────────────
+# Adjusted for accumulation account reality.
+# Paper trading still proves the system works, but with realistic small $.
 go_live_criteria:
-  min_days_trading: 30              # Minimum calendar days of paper trading
-  min_trades: 10                    # At least 10 round-trip trades
-  max_drawdown: 0.10               # Max drawdown under 10%
-  min_win_rate: 0.40                # Win rate above 40%
-  min_profit_factor: 1.0            # Gross profit / gross loss >= 1.0
-  max_daily_loss_events: 2          # No more than 2 daily loss shutdowns
+  min_days_trading: 21              # 3 weeks (was 30 — you're putting in real $ weekly)
+  min_trades: 6                     # 6 trades (was 10 — fewer with small account)
+  max_drawdown: 0.15               # 15% (was 10% — tighter limits don't make sense on $300)
+  min_win_rate: 0.35                # 35% (was 40% — momentum strategies can win less often but bigger)
+  min_profit_factor: 1.0            # Gross profit / gross loss >= 1.0 (unchanged)
+  max_daily_loss_events: 3          # 3 allowed (was 2 — daily swings are larger % on small $)

@@ -1,5 +1,8 @@
 """
-Trading Engine Status — quick snapshot of account, positions, and 30-day progress.
+Trading Engine Status — quick snapshot for small-account accumulation mode.
+
+The key metric: total deposited vs current value.
+That's YOUR money in vs what it's worth now.
 
 Usage:
     python status.py
@@ -12,6 +15,7 @@ from dotenv import load_dotenv
 
 from core.logging import get_logger
 from data.db import init_db, get_session, Order, PortfolioState, RiskEvent
+from capital.manager import get_accumulation_summary
 from execution.alpaca_broker import get_account_with_retry as get_account, get_positions_with_retry as get_positions
 
 load_dotenv()
@@ -112,7 +116,7 @@ def check_go_live_readiness(session, trade_stats, equity_history, risk_events):
     checks = {}
 
     # 1. Minimum days
-    min_days = criteria.get("min_days_trading", 30)
+    min_days = criteria.get("min_days_trading", 21)
     days_active = trade_stats.get("days_active", 0)
     checks["min_days"] = {
         "required": min_days,
@@ -122,7 +126,7 @@ def check_go_live_readiness(session, trade_stats, equity_history, risk_events):
     }
 
     # 2. Minimum trades
-    min_trades = criteria.get("min_trades", 10)
+    min_trades = criteria.get("min_trades", 6)
     total_trades = trade_stats.get("total_trades", 0)
     checks["min_trades"] = {
         "required": min_trades,
@@ -132,7 +136,7 @@ def check_go_live_readiness(session, trade_stats, equity_history, risk_events):
     }
 
     # 3. Max drawdown
-    max_dd = criteria.get("max_drawdown", 0.10)
+    max_dd = criteria.get("max_drawdown", 0.15)
     actual_dd = equity_history.get("drawdown_pct", 0) / 100
     checks["max_drawdown"] = {
         "required": f"{max_dd:.0%}",
@@ -142,7 +146,7 @@ def check_go_live_readiness(session, trade_stats, equity_history, risk_events):
     }
 
     # 4. Daily loss events
-    max_events = criteria.get("max_daily_loss_events", 2)
+    max_events = criteria.get("max_daily_loss_events", 3)
     loss_events = len([e for e in risk_events if e["type"] == "daily_loss_limit"])
     checks["daily_loss_events"] = {
         "required": max_events,
@@ -162,8 +166,26 @@ def check_go_live_readiness(session, trade_stats, equity_history, risk_events):
 def print_status():
     """Print a formatted status report."""
     print("\n" + "=" * 60)
-    print("  TRADING ENGINE STATUS")
+    print("  TRADING ENGINE STATUS (Accumulation Mode)")
+    print("  $100/week — get rich or go broke")
     print("=" * 60)
+
+    # ── The number that matters ──────────────────────────────────────────
+    init_db()
+    session = get_session()
+
+    summary = get_accumulation_summary(session)
+    print(f"\n--- YOUR MONEY ---")
+    print(f"  Total deposited: ${summary['total_deposited']:>10,.2f}")
+    print(f"  Current value:   ${summary['current_equity']:>10,.2f}")
+    gain = summary['gain_loss']
+    marker = "+" if gain >= 0 else ""
+    print(f"  Gain/Loss:       {marker}${gain:>10,.2f} ({marker}{summary['gain_loss_pct']:.1f}%)")
+    print(f"  Weeks active:    {summary['weeks_active']}")
+
+    if summary['weeks_active'] > 0:
+        avg_per_week = summary['total_deposited'] / summary['weeks_active']
+        print(f"  Avg deposit/wk:  ${avg_per_week:>10,.2f}")
 
     # Alpaca account
     try:
@@ -176,7 +198,6 @@ def print_status():
     except Exception as e:
         print(f"\n--- Alpaca Account ---")
         print(f"  ERROR: {e}")
-        acct = None
 
     # Positions
     try:
@@ -188,7 +209,7 @@ def print_status():
             for sym, pos in sorted(positions.items()):
                 pl_pct = (pos["unrealized_pl"] / (pos["avg_entry"] * pos["qty"])) * 100 if pos["avg_entry"] > 0 else 0
                 marker = "+" if pos["unrealized_pl"] >= 0 else ""
-                print(f"  {sym:6s}  {pos['qty']:>6.0f} shares  "
+                print(f"  {sym:6s}  {pos['qty']:>8.2f} shares  "
                       f"@ ${pos['avg_entry']:>8.2f}  "
                       f"now ${pos['current_price']:>8.2f}  "
                       f"P&L: {marker}${pos['unrealized_pl']:>8.2f} ({marker}{pl_pct:.1f}%)")
@@ -201,10 +222,7 @@ def print_status():
         print(f"\n--- Positions ---")
         print(f"  ERROR: {e}")
 
-    # Local DB stats
-    init_db()
-    session = get_session()
-
+    # Trade stats
     trade_stats = get_trade_stats(session)
     print(f"\n--- Trade History ---")
     print(f"  Total fills:  {trade_stats['total_trades']}")
@@ -219,7 +237,6 @@ def print_status():
         print(f"  Start:        ${equity_history['start_equity']:>12,.2f}")
         print(f"  Peak:         ${equity_history['peak']:>12,.2f}")
         print(f"  Current:      ${equity_history['current']:>12,.2f}")
-        print(f"  Total return: {equity_history['total_return_pct']:>+.2f}%")
         print(f"  Drawdown:     {equity_history['drawdown_pct']:.2f}%")
     else:
         print("  No snapshots yet")
@@ -236,7 +253,7 @@ def print_status():
 
     # Go-live readiness
     readiness = check_go_live_readiness(session, trade_stats, equity_history, risk_events)
-    print(f"\n--- 30-Day Go-Live Checklist ---")
+    print(f"\n--- Go-Live Checklist ---")
     for key, check in readiness["checks"].items():
         icon = "PASS" if check["passed"] else "FAIL"
         print(f"  [{icon}] {check['label']}")
@@ -247,6 +264,19 @@ def print_status():
         passed = sum(1 for c in readiness["checks"].values() if c["passed"])
         total = len(readiness["checks"])
         print(f"\n  >>> {passed}/{total} criteria met — keep paper trading <<<")
+
+    # Projection
+    if summary['weeks_active'] > 0 and summary['total_deposited'] > 0:
+        weekly_return = summary['gain_loss_pct'] / summary['weeks_active'] / 100 if summary['weeks_active'] > 1 else 0
+        print(f"\n--- Projection (if current pace holds) ---")
+        deposit_per_week = 100
+        current = summary['current_equity']
+        for label, weeks in [("6 months", 26), ("1 year", 52), ("2 years", 104), ("5 years", 260)]:
+            projected = current
+            for _ in range(weeks):
+                projected = projected * (1 + weekly_return) + deposit_per_week
+            total_in = summary['total_deposited'] + (deposit_per_week * weeks)
+            print(f"  {label:10s}: ${projected:>10,.0f}  (${total_in:,.0f} deposited)")
 
     session.close()
     print("\n" + "=" * 60 + "\n")

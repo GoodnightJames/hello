@@ -3,15 +3,16 @@ Risk Enforcer — hard limits that override all other modules.
 
 The risk engine is the final gate before any order submission.
 It enforces:
-1. Max risk per trade (dynamic — set by performance mode)
+1. Max deployment per trade (dynamic — set by performance mode, cash-based)
 2. Max concurrent positions (dynamic — set by performance mode)
 3. No averaging down (NEVER)
-4. Daily loss limit (2% → shutdown)
-5. Weekly drawdown limit (5% → review mode)
-6. Consecutive loss shutdown (3 losses → halt)
+4. Daily loss limit (5% → shutdown for small accounts)
+5. Weekly drawdown limit (10% → review mode)
+6. Consecutive loss shutdown (5 losses → halt)
 7. Kill switch (env var)
-8. Weekly trade throttle (max 5 trades/week)
+8. Weekly trade throttle (max 6 trades/week)
 
+Tuned for small accumulation accounts ($100/week deposits).
 Every risk event is logged to the risk_events table.
 """
 
@@ -260,26 +261,31 @@ def check_position_limits(session, risk_params, proposed_symbol=None, mode_param
     return True, details
 
 
-def calculate_max_trade_size(risk_params, total_equity, mode_params=None):
+def calculate_max_trade_size(risk_params, total_equity, mode_params=None, cash=None):
     """
     Calculate maximum dollar amount per trade based on risk limits.
 
-    When mode_params is provided (from performance manager), the mode's
-    risk_per_trade_pct overrides the base config.
+    For small accumulation accounts, risk_per_trade_pct represents the
+    fraction of available CASH to deploy (not a tiny % of equity).
+    E.g., 0.90 means deploy 90% of available cash.
 
     Args:
         risk_params: Risk parameters dict.
         total_equity: Current total portfolio equity.
         mode_params: Optional dict from performance.manager.get_mode_params().
+        cash: Available cash. If provided, sizing is cash-based (small account mode).
 
     Returns:
-        Float — maximum dollar risk per trade.
+        Float — maximum dollar amount per trade.
     """
     if mode_params:
-        max_risk_pct = mode_params.get("risk_per_trade_pct", 0.005)
+        max_risk_pct = mode_params.get("risk_per_trade_pct", 0.90)
     else:
-        max_risk_pct = risk_params.get("position_limits", {}).get("max_risk_per_trade", 0.005)
-    return total_equity * max_risk_pct
+        max_risk_pct = risk_params.get("position_limits", {}).get("max_risk_per_trade", 0.90)
+
+    # Use cash-based sizing when cash is available (accumulation mode)
+    base = cash if cash is not None else total_equity
+    return base * max_risk_pct
 
 
 def validate_order(session, risk_params, decision, portfolio_state):
@@ -416,8 +422,9 @@ def validate_order(session, risk_params, decision, portfolio_state):
             "risk_checks": checks,
         }
 
-    # All checks passed — size uses mode-adjusted risk percentage
-    max_trade = calculate_max_trade_size(risk_params, total_equity, mode_params=mode_params)
+    # All checks passed — size uses mode-adjusted deployment percentage
+    cash = portfolio_state.get("cash", 0)
+    max_trade = calculate_max_trade_size(risk_params, total_equity, mode_params=mode_params, cash=cash)
 
     logger.info(
         f"Order APPROVED: {action} {symbol} (mode={mode})",
