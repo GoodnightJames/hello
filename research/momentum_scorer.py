@@ -7,11 +7,14 @@ Two momentum components:
 2. Relative momentum: Among risk assets with positive absolute momentum,
    which has the highest 12-month return? Hold that one.
 
-v3.0 optimizations:
+v4.0 optimizations:
 - Multi-timeframe confirmation (12m + 6m alignment)
 - Minimum edge threshold (skip marginal signals)
 - RSI(2) overbought filter (don't buy at the top)
 - Composite signal strength score (for position sizing)
+- Multi-position: BUY top N qualified assets (not just #1)
+- Fast exit: sell when 3-month momentum breaks down
+- Volatility-scaled sizing: low-vol assets get bigger positions
 """
 
 import pandas as pd
@@ -97,9 +100,6 @@ def check_multi_timeframe(features, symbol, benchmark, config):
     """
     Check if shorter-term returns confirm the 12-month signal.
 
-    Prevents buying into dying trends: a stock can have +20% 12m return
-    but be down -10% over 6 months — the trend is reversing.
-
     Returns:
         (confirmed: bool, details: dict)
     """
@@ -108,11 +108,9 @@ def check_multi_timeframe(features, symbol, benchmark, config):
         return True, {"reason": "multi_timeframe disabled"}
 
     returns = features.get("returns", {})
-
     details = {}
     confirmed = True
 
-    # 6-month confirmation
     if mt_config.get("require_6m_positive", True):
         returns_6m = returns.get("6m", pd.DataFrame())
         if not returns_6m.empty and symbol in returns_6m.columns and benchmark in returns_6m.columns:
@@ -125,7 +123,6 @@ def check_multi_timeframe(features, symbol, benchmark, config):
                 confirmed = False
                 details["blocked_by"] = "6m return below benchmark"
 
-    # 3-month confirmation (optional, off by default)
     if mt_config.get("require_3m_positive", False):
         returns_3m = returns.get("3m", pd.DataFrame())
         if not returns_3m.empty and symbol in returns_3m.columns and benchmark in returns_3m.columns:
@@ -150,9 +147,6 @@ def check_minimum_edge(return_12m, benchmark_return, config):
     """
     Check if excess return over benchmark meets minimum threshold.
 
-    A 0.5% edge over T-bills isn't worth trading — slippage and spreads
-    will eat the alpha. Require a meaningful edge before acting.
-
     Returns:
         (has_edge: bool, excess_return: float)
     """
@@ -169,9 +163,6 @@ def check_minimum_edge(return_12m, benchmark_return, config):
 def check_rsi_filter(features, symbol, config):
     """
     Check RSI(2) overbought/oversold conditions.
-
-    RSI(2) > 90: asset is at a short-term extreme — wait for pullback.
-    RSI(2) < 10: asset is oversold — boost signal strength.
 
     Returns:
         (allowed: bool, rsi_value: float or None, strength_multiplier: float)
@@ -198,7 +189,6 @@ def check_rsi_filter(features, symbol, config):
         )
         return False, current_rsi, 1.0
 
-    # Boost for oversold conditions
     multiplier = 1.0
     if current_rsi < 10:
         multiplier = oversold_boost
@@ -209,12 +199,94 @@ def check_rsi_filter(features, symbol, config):
     return True, current_rsi, multiplier
 
 
+def check_fast_exit(features, symbol, benchmark, config):
+    """
+    Check if a held position should be exited early due to 3-month breakdown.
+
+    The standard 12-month exit is too slow — a stock can drop 30% before
+    the 12m return turns negative. If 3-month return breaks below benchmark,
+    the trend is deteriorating. Exit now, don't wait.
+
+    Returns:
+        (should_exit: bool, details: dict)
+    """
+    fast_exit_config = config.get("signals", {}).get("fast_exit", {})
+    if not fast_exit_config.get("enabled", False):
+        return False, {}
+
+    if not fast_exit_config.get("exit_on_3m_breakdown", True):
+        return False, {}
+
+    returns = features.get("returns", {})
+    returns_3m = returns.get("3m", pd.DataFrame())
+
+    if returns_3m.empty or symbol not in returns_3m.columns:
+        return False, {}
+
+    if benchmark not in returns_3m.columns:
+        return False, {}
+
+    latest = returns_3m.iloc[-1]
+    sym_3m = float(latest[symbol])
+    bench_3m = float(latest[benchmark])
+
+    details = {
+        "return_3m": round(sym_3m, 4),
+        "benchmark_3m": round(bench_3m, 4),
+    }
+
+    if sym_3m < bench_3m:
+        logger.warning(
+            f"FAST EXIT triggered for {symbol}: 3m return {sym_3m:.4f} < benchmark {bench_3m:.4f}",
+            extra={"extra_data": details},
+        )
+        return True, details
+
+    return False, details
+
+
+def compute_volatility_scalar(features, symbol):
+    """
+    Compute inverse-volatility position size scalar.
+
+    Low volatility assets get bigger positions (less risky per dollar).
+    Uses 20-day realized vol, annualized. Target 15%.
+    Clamped [0.5, 1.5].
+
+    Returns:
+        float — volatility scalar for position sizing
+    """
+    prices = features.get("prices", pd.DataFrame())
+    if prices.empty or symbol not in prices.columns:
+        return 1.0
+
+    sym_prices = prices[symbol].dropna()
+    if len(sym_prices) < 21:
+        return 1.0
+
+    returns = sym_prices.pct_change().dropna().tail(20)
+    if len(returns) < 10:
+        return 1.0
+
+    realized_vol = float(returns.std()) * (252 ** 0.5)
+    if realized_vol <= 0:
+        return 1.0
+
+    target_vol = 0.15
+    scalar = target_vol / realized_vol
+    scalar = max(0.5, min(1.5, scalar))
+
+    logger.info(
+        f"Volatility scalar for {symbol}: {scalar:.2f} (realized vol: {realized_vol:.1%})",
+    )
+    return scalar
+
+
 def compute_signal_strength(features, symbol, benchmark, config):
     """
     Compute composite signal strength from multi-timeframe returns.
 
-    Stronger momentum = higher confidence = larger position.
-    The strength score (0.0 to 1.0+) flows through to position sizing.
+    Includes momentum acceleration bonus and volatility adjustment.
 
     Returns:
         float — composite signal strength score
@@ -228,7 +300,6 @@ def compute_signal_strength(features, symbol, benchmark, config):
     weight_6m = ss_config.get("weight_6m", 0.30)
     weight_3m = ss_config.get("weight_3m", 0.20)
 
-    # Get excess returns over benchmark for each timeframe
     scores = {}
     for label, weight in [("12m", weight_12m), ("6m", weight_6m), ("3m", weight_3m)]:
         ret_df = returns.get(label, pd.DataFrame())
@@ -239,16 +310,10 @@ def compute_signal_strength(features, symbol, benchmark, config):
         else:
             scores[label] = 0.0
 
-    # Raw composite score (can be negative, but we only use for BUY signals)
     raw_score = sum(scores.values())
-
-    # Normalize: 10% composite excess return = strength 1.0
-    # Higher is stronger, lower is weaker
     strength = max(0.1, min(2.0, raw_score / 0.10)) if raw_score > 0 else 0.1
 
-    # Momentum acceleration bonus: if 3m excess > 6m excess, momentum is
-    # accelerating — the trend is getting stronger, not fading.
-    # This is one of the strongest predictors of continued momentum.
+    # Momentum acceleration bonus
     ret_3m = returns.get("3m", pd.DataFrame())
     ret_6m = returns.get("6m", pd.DataFrame())
     accelerating = False
@@ -259,14 +324,20 @@ def compute_signal_strength(features, symbol, benchmark, config):
         excess_6m = float(ret_6m.iloc[-1][symbol]) - float(ret_6m.iloc[-1][benchmark])
         if excess_3m > excess_6m and excess_3m > 0:
             accelerating = True
-            strength *= 1.15  # 15% boost for accelerating momentum
-            strength = min(2.0, strength)  # Cap at 2.0
+            strength *= 1.15
+            strength = min(2.0, strength)
+
+    # Volatility adjustment
+    vol_scalar = compute_volatility_scalar(features, symbol)
+    strength *= vol_scalar
+    strength = max(0.1, min(2.0, strength))
 
     logger.info(
         f"Signal strength for {symbol}: {strength:.2f}",
         extra={"extra_data": {
             "scores": scores, "raw": round(raw_score, 4),
             "accelerating": accelerating,
+            "vol_scalar": round(vol_scalar, 2),
         }},
     )
     return strength
@@ -276,16 +347,8 @@ def score_dual_momentum(features, strategy_config):
     """
     Run the full dual momentum scoring pipeline with alpha optimizations.
 
-    Pipeline:
-    1. Compute 12-month returns for risk assets and benchmark.
-    2. Check absolute momentum (return > SHY return).
-    3. Check multi-timeframe confirmation (6m alignment).
-    4. Check minimum edge threshold (2% excess return).
-    5. Check RSI(2) overbought filter.
-    6. Rank risk assets by relative momentum.
-    7. Compute signal strength score for position sizing.
-    8. Select the top-ranked qualifying asset.
-    9. If no risk asset qualifies → rotate to safe asset (AGG/SHY).
+    v4.0: Multi-position BUY (up to N qualified assets), fast exits,
+    volatility-scaled sizing.
 
     Args:
         features: Dict from feature_store.build_features().
@@ -294,7 +357,7 @@ def score_dual_momentum(features, strategy_config):
     Returns:
         List of signal dicts with signal_strength for position sizing.
     """
-    logger.info("Running dual momentum scoring (v3.0 with optimizations)")
+    logger.info("Running dual momentum scoring (v4.0 multi-position)")
 
     returns = features.get("returns", {})
     returns_12m = returns.get("12m", pd.DataFrame())
@@ -303,11 +366,11 @@ def score_dual_momentum(features, strategy_config):
         logger.warning("No 12-month return data — cannot score")
         return []
 
-    # Get strategy instruments
     instruments = strategy_config.get("instruments", {})
     risk_assets = instruments.get("risk_assets", [])
     safe_assets = instruments.get("safe_assets", [])
     benchmark = strategy_config.get("signals", {}).get("benchmark", "SHY")
+    max_buy_signals = strategy_config.get("signals", {}).get("max_buy_signals", 1)
 
     all_symbols = risk_assets + safe_assets
     available = [s for s in all_symbols if s in returns_12m.columns]
@@ -316,48 +379,58 @@ def score_dual_momentum(features, strategy_config):
         logger.warning("No strategy instruments found in data")
         return []
 
-    # Step 1: Absolute momentum
     abs_momentum = compute_absolute_momentum(returns_12m, benchmark)
-
-    # Step 2: Relative momentum among risk assets
     risk_available = [s for s in risk_assets if s in returns_12m.columns]
     relative_ranking = compute_relative_momentum(returns_12m, risk_available)
 
-    # Step 3: Build qualified candidates (pass all filters)
     latest_returns = returns_12m.iloc[-1]
     benchmark_return = float(latest_returns.get(benchmark, 0))
 
     signals = []
-    selected_asset = None
+    selected_count = 0
 
     for rank, (symbol, ret) in enumerate(relative_ranking):
         has_abs = abs_momentum.get(symbol, False)
 
         if has_abs:
-            # Check multi-timeframe confirmation
+            # Fast exit check — overrides everything
+            should_exit, exit_details = check_fast_exit(
+                features, symbol, benchmark, strategy_config
+            )
+            if should_exit:
+                signals.append({
+                    "symbol": symbol,
+                    "signal_type": "SELL",
+                    "score": ret,
+                    "signal_strength": 0.0,
+                    "metadata": {
+                        "absolute_momentum": True,
+                        "relative_rank": rank + 1,
+                        "benchmark_return": benchmark_return,
+                        "asset_return": ret,
+                        "fast_exit": True,
+                        "exit_details": exit_details,
+                    },
+                })
+                continue
+
             mt_confirmed, mt_details = check_multi_timeframe(
                 features, symbol, benchmark, strategy_config
             )
-
-            # Check minimum edge
             has_edge, excess_return = check_minimum_edge(ret, benchmark_return, strategy_config)
-
-            # Check RSI overbought filter
             rsi_allowed, rsi_value, rsi_multiplier = check_rsi_filter(
                 features, symbol, strategy_config
             )
 
-            # All filters must pass for BUY
             fully_qualified = mt_confirmed and has_edge and rsi_allowed
 
-            if fully_qualified and selected_asset is None:
-                # Compute signal strength for position sizing
+            if fully_qualified and selected_count < max_buy_signals:
                 strength = compute_signal_strength(
                     features, symbol, benchmark, strategy_config
                 )
-                strength *= rsi_multiplier  # Apply oversold boost if applicable
+                strength *= rsi_multiplier
 
-                selected_asset = symbol
+                selected_count += 1
                 signals.append({
                     "symbol": symbol,
                     "signal_type": "BUY",
@@ -372,10 +445,10 @@ def score_dual_momentum(features, strategy_config):
                         "multi_timeframe": mt_details,
                         "rsi_2": rsi_value,
                         "signal_strength": round(strength, 3),
+                        "buy_slot": selected_count,
                     },
                 })
             elif fully_qualified:
-                # Qualified but not top-ranked
                 strength = compute_signal_strength(
                     features, symbol, benchmark, strategy_config
                 )
@@ -393,7 +466,6 @@ def score_dual_momentum(features, strategy_config):
                     },
                 })
             else:
-                # Has absolute momentum but failed a filter — SKIP not SELL
                 skip_reasons = []
                 if not mt_confirmed:
                     skip_reasons.append(f"6m trend not confirmed")
@@ -404,7 +476,7 @@ def score_dual_momentum(features, strategy_config):
 
                 signals.append({
                     "symbol": symbol,
-                    "signal_type": "HOLD",  # Don't sell — momentum exists, just filtered
+                    "signal_type": "HOLD",
                     "score": ret,
                     "signal_strength": 0.0,
                     "metadata": {
@@ -417,7 +489,6 @@ def score_dual_momentum(features, strategy_config):
                     },
                 })
         else:
-            # No absolute momentum — should not be held
             signals.append({
                 "symbol": symbol,
                 "signal_type": "SELL",
@@ -432,8 +503,7 @@ def score_dual_momentum(features, strategy_config):
             })
 
     # If no risk asset qualified → rotate to safe asset
-    if selected_asset is None:
-        # Rank safe assets by return and pick the best one
+    if selected_count == 0:
         safe_available = [s for s in safe_assets if s in returns_12m.columns and s != benchmark]
         if safe_available:
             safe_ranked = sorted(
@@ -447,7 +517,7 @@ def score_dual_momentum(features, strategy_config):
                 "symbol": best_safe,
                 "signal_type": "BUY",
                 "score": safe_return,
-                "signal_strength": 0.5,  # Reduced strength for defensive rotation
+                "signal_strength": 0.5,
                 "metadata": {
                     "absolute_momentum": False,
                     "relative_rank": 0,
@@ -461,7 +531,8 @@ def score_dual_momentum(features, strategy_config):
         "Dual momentum scoring complete",
         extra={
             "extra_data": {
-                "selected_asset": selected_asset,
+                "buy_count": selected_count,
+                "max_buy_signals": max_buy_signals,
                 "signal_count": len(signals),
                 "signals": [
                     {

@@ -11,6 +11,8 @@ from research.momentum_scorer import (
     check_multi_timeframe,
     check_minimum_edge,
     check_rsi_filter,
+    check_fast_exit,
+    compute_volatility_scalar,
     compute_signal_strength,
     score_dual_momentum,
 )
@@ -352,3 +354,288 @@ class TestScoreDualMomentum:
         if buy_signals:
             # Either QQQ gets BUY or bonds rotation
             assert buy_signals[0]["symbol"] != "SPY"
+
+
+class TestFastExit:
+    def test_exit_when_3m_below_benchmark(self, strategy_config):
+        """3-month return below benchmark triggers fast exit."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        features = {
+            "returns": {
+                "3m": pd.DataFrame(
+                    {"SPY": [0.05, 0.03, 0.01, -0.01, -0.02], "SHY": [0.01] * 5},
+                    index=dates,
+                ),
+            },
+        }
+        should_exit, details = check_fast_exit(features, "SPY", "SHY", strategy_config)
+        assert should_exit is True
+        assert details["return_3m"] < details["benchmark_3m"]
+
+    def test_no_exit_when_3m_above_benchmark(self, strategy_config):
+        """3-month return above benchmark = no exit."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        features = {
+            "returns": {
+                "3m": pd.DataFrame(
+                    {"SPY": [0.05, 0.06, 0.07, 0.08, 0.10], "SHY": [0.01] * 5},
+                    index=dates,
+                ),
+            },
+        }
+        should_exit, details = check_fast_exit(features, "SPY", "SHY", strategy_config)
+        assert should_exit is False
+
+    def test_disabled_never_exits(self):
+        """When disabled, never triggers exit."""
+        config = {"signals": {"fast_exit": {"enabled": False}}}
+        should_exit, details = check_fast_exit({}, "SPY", "SHY", config)
+        assert should_exit is False
+        assert details == {}
+
+    def test_missing_data_no_exit(self, strategy_config):
+        """Missing 3m data = no exit (safe default)."""
+        features = {"returns": {}}
+        should_exit, _ = check_fast_exit(features, "SPY", "SHY", strategy_config)
+        assert should_exit is False
+
+
+class TestVolatilityScalar:
+    def test_low_vol_gets_bigger_scalar(self):
+        """Low volatility asset should get scalar > 1.0."""
+        dates = pd.date_range("2024-01-01", periods=30, freq="B")
+        # Very stable prices (low vol)
+        prices = pd.DataFrame(
+            {"SHY": 85.0 + np.cumsum(np.random.normal(0, 0.01, 30))},
+            index=dates,
+        )
+        np.random.seed(10)
+        scalar = compute_volatility_scalar({"prices": prices}, "SHY")
+        assert scalar >= 1.0  # Low vol -> bigger position
+
+    def test_high_vol_gets_smaller_scalar(self):
+        """High volatility asset should get scalar < 1.0."""
+        dates = pd.date_range("2024-01-01", periods=30, freq="B")
+        np.random.seed(42)
+        # Very volatile prices
+        prices = pd.DataFrame(
+            {"MEME": 100 * np.cumprod(1 + np.random.normal(0, 0.05, 30))},
+            index=dates,
+        )
+        scalar = compute_volatility_scalar({"prices": prices}, "MEME")
+        assert scalar <= 1.0  # High vol -> smaller position
+
+    def test_scalar_clamped_min(self):
+        """Scalar should never go below 0.5."""
+        dates = pd.date_range("2024-01-01", periods=30, freq="B")
+        np.random.seed(99)
+        # Extremely volatile
+        prices = pd.DataFrame(
+            {"WILD": 100 * np.cumprod(1 + np.random.normal(0, 0.15, 30))},
+            index=dates,
+        )
+        scalar = compute_volatility_scalar({"prices": prices}, "WILD")
+        assert scalar >= 0.5
+
+    def test_scalar_clamped_max(self):
+        """Scalar should never exceed 1.5."""
+        dates = pd.date_range("2024-01-01", periods=30, freq="B")
+        # Nearly zero vol
+        prices = pd.DataFrame(
+            {"STABLE": [100.00 + i * 0.001 for i in range(30)]},
+            index=dates,
+        )
+        scalar = compute_volatility_scalar({"prices": prices}, "STABLE")
+        assert scalar <= 1.5
+
+    def test_missing_symbol_returns_1(self):
+        """Missing symbol returns neutral 1.0."""
+        scalar = compute_volatility_scalar({"prices": pd.DataFrame()}, "MISSING")
+        assert scalar == 1.0
+
+    def test_insufficient_data_returns_1(self):
+        """Less than 21 data points returns neutral 1.0."""
+        dates = pd.date_range("2024-01-01", periods=10, freq="B")
+        prices = pd.DataFrame({"SPY": range(10)}, index=dates)
+        scalar = compute_volatility_scalar({"prices": prices}, "SPY")
+        assert scalar == 1.0
+
+
+class TestMultiPositionBuy:
+    def test_multiple_buy_signals(self, strategy_config):
+        """With max_buy_signals=3, should generate up to 3 BUY signals."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        # Three strong risk assets all beating benchmark
+        returns_12m = pd.DataFrame(
+            {
+                "SPY": [0.20] * 5,
+                "QQQ": [0.18] * 5,
+                "IWM": [0.15] * 5,
+                "XLK": [0.12] * 5,
+                "AGG": [0.03] * 5,
+                "SHY": [0.04] * 5,
+                "TLT": [0.02] * 5,
+            },
+            index=dates,
+        )
+        returns_6m = pd.DataFrame(
+            {
+                "SPY": [0.12] * 5,
+                "QQQ": [0.10] * 5,
+                "IWM": [0.08] * 5,
+                "XLK": [0.07] * 5,
+                "SHY": [0.02] * 5,
+            },
+            index=dates,
+        )
+        returns_3m = pd.DataFrame(
+            {
+                "SPY": [0.06] * 5,
+                "QQQ": [0.05] * 5,
+                "IWM": [0.04] * 5,
+                "XLK": [0.03] * 5,
+                "SHY": [0.01] * 5,
+            },
+            index=dates,
+        )
+        features = {
+            "prices": pd.DataFrame(),
+            "returns": {"12m": returns_12m, "6m": returns_6m, "3m": returns_3m},
+            "sma": {},
+            "rsi_2": pd.DataFrame(),
+        }
+        signals = score_dual_momentum(features, strategy_config)
+        buy_signals = [s for s in signals if s["signal_type"] == "BUY"]
+        # Should have up to 3 BUY signals (config max_buy_signals=3)
+        assert len(buy_signals) <= 3
+        assert len(buy_signals) >= 2  # At least SPY and QQQ should qualify
+
+    def test_excess_qualified_become_hold(self, strategy_config):
+        """Assets beyond max_buy_signals should get HOLD, not BUY."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        # Five strong risk assets
+        returns_12m = pd.DataFrame(
+            {
+                "SPY": [0.25] * 5,
+                "QQQ": [0.22] * 5,
+                "IWM": [0.20] * 5,
+                "XLK": [0.18] * 5,
+                "XLE": [0.15] * 5,
+                "AGG": [0.03] * 5,
+                "SHY": [0.04] * 5,
+                "TLT": [0.02] * 5,
+            },
+            index=dates,
+        )
+        returns_6m = pd.DataFrame(
+            {
+                "SPY": [0.15] * 5,
+                "QQQ": [0.13] * 5,
+                "IWM": [0.11] * 5,
+                "XLK": [0.10] * 5,
+                "XLE": [0.09] * 5,
+                "SHY": [0.02] * 5,
+            },
+            index=dates,
+        )
+        returns_3m = pd.DataFrame(
+            {
+                "SPY": [0.08] * 5,
+                "QQQ": [0.07] * 5,
+                "IWM": [0.06] * 5,
+                "XLK": [0.05] * 5,
+                "XLE": [0.04] * 5,
+                "SHY": [0.01] * 5,
+            },
+            index=dates,
+        )
+        features = {
+            "prices": pd.DataFrame(),
+            "returns": {"12m": returns_12m, "6m": returns_6m, "3m": returns_3m},
+            "sma": {},
+            "rsi_2": pd.DataFrame(),
+        }
+        signals = score_dual_momentum(features, strategy_config)
+        buy_signals = [s for s in signals if s["signal_type"] == "BUY"]
+        hold_signals = [s for s in signals if s["signal_type"] == "HOLD"]
+        # Max 3 BUYs
+        assert len(buy_signals) == 3
+        # At least some assets should be HOLD (qualified but beyond limit)
+        qualified_holds = [s for s in hold_signals if s["signal_strength"] > 0]
+        assert len(qualified_holds) >= 1
+
+    def test_buy_signals_have_slot_metadata(self, strategy_config):
+        """BUY signals should include buy_slot in metadata."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        returns_12m = pd.DataFrame(
+            {
+                "SPY": [0.20] * 5,
+                "QQQ": [0.18] * 5,
+                "AGG": [0.03] * 5,
+                "SHY": [0.04] * 5,
+                "TLT": [0.02] * 5,
+            },
+            index=dates,
+        )
+        returns_6m = pd.DataFrame(
+            {
+                "SPY": [0.12] * 5,
+                "QQQ": [0.10] * 5,
+                "SHY": [0.02] * 5,
+            },
+            index=dates,
+        )
+        features = {
+            "prices": pd.DataFrame(),
+            "returns": {"12m": returns_12m, "6m": returns_6m, "3m": pd.DataFrame()},
+            "sma": {},
+            "rsi_2": pd.DataFrame(),
+        }
+        signals = score_dual_momentum(features, strategy_config)
+        buy_signals = [s for s in signals if s["signal_type"] == "BUY"]
+        for s in buy_signals:
+            assert "buy_slot" in s["metadata"]
+            assert s["metadata"]["buy_slot"] >= 1
+
+    def test_fast_exit_sell_in_scoring(self, strategy_config):
+        """Fast exit should emit SELL with fast_exit metadata in full pipeline."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        returns_12m = pd.DataFrame(
+            {
+                "SPY": [0.20] * 5,
+                "QQQ": [0.15] * 5,
+                "AGG": [0.03] * 5,
+                "SHY": [0.04] * 5,
+                "TLT": [0.02] * 5,
+            },
+            index=dates,
+        )
+        returns_6m = pd.DataFrame(
+            {
+                "SPY": [0.12] * 5,
+                "QQQ": [0.08] * 5,
+                "SHY": [0.02] * 5,
+            },
+            index=dates,
+        )
+        returns_3m = pd.DataFrame(
+            {
+                # SPY 3m is below benchmark -> fast exit
+                "SPY": [0.05, 0.03, 0.01, -0.01, -0.02],
+                # QQQ 3m is fine
+                "QQQ": [0.04, 0.05, 0.06, 0.07, 0.08],
+                "SHY": [0.01] * 5,
+            },
+            index=dates,
+        )
+        features = {
+            "prices": pd.DataFrame(),
+            "returns": {"12m": returns_12m, "6m": returns_6m, "3m": returns_3m},
+            "sma": {},
+            "rsi_2": pd.DataFrame(),
+        }
+        signals = score_dual_momentum(features, strategy_config)
+        spy_signals = [s for s in signals if s["symbol"] == "SPY"]
+        assert len(spy_signals) == 1
+        assert spy_signals[0]["signal_type"] == "SELL"
+        assert spy_signals[0]["metadata"].get("fast_exit") is True

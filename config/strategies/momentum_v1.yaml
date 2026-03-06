@@ -6,7 +6,7 @@
 # The safety net is the regime filter and the momentum signal itself —
 # when momentum is negative, we rotate to bonds, not cash.
 
-version: "3.0.0"
+version: "4.0.0"
 name: dual_momentum_trend_core
 description: >
   Dual momentum with absolute and relative momentum signals.
@@ -65,6 +65,18 @@ signals:
     weight_12m: 0.50             # 12-month return (primary)
     weight_6m: 0.30              # 6-month return (confirmation)
     weight_3m: 0.20              # 3-month return (acceleration)
+
+  # --- v4.0: Multi-position and fast exits ---
+  # Multi-position: hold top N qualified assets simultaneously
+  # With 12 risk assets and 3 max positions, diversify across sectors
+  max_buy_signals: 3               # Generate up to 3 BUY signals (was 1)
+
+  # Fast exit: sell when 3-month momentum breaks down
+  # Don't wait 12 months for the exit signal — if 3m return goes negative
+  # vs benchmark, the trend is broken. Get out early.
+  fast_exit:
+    enabled: true
+    exit_on_3m_breakdown: true     # Sell if 3m return < benchmark
 
 regime_filter:
   enabled: true
