@@ -21,7 +21,7 @@ from datetime import datetime
 import yaml
 
 from core.logging import get_logger
-from data.db import PortfolioState, Deposit, get_session, init_db
+from data.db import PortfolioState, Deposit, Trade, CostBasis, get_session, init_db
 
 logger = get_logger("capital.manager")
 
@@ -331,9 +331,149 @@ def get_deployable_cash(portfolio_state):
     return max(0, cash - buffer)
 
 
-def update_position(session, symbol, qty_change, price, current_state):
+def update_cost_basis(session, symbol, qty_change, price):
     """
-    Update a position after a fill.
+    Update the cost basis for a symbol after a buy fill.
+
+    Uses weighted average: new_avg = (old_total + new_cost) / (old_qty + new_qty)
+
+    Args:
+        session: DB session.
+        symbol: Ticker symbol.
+        qty_change: Shares bought (positive).
+        price: Fill price.
+    """
+    basis = session.query(CostBasis).filter(CostBasis.symbol == symbol).first()
+    if basis is None:
+        basis = CostBasis(symbol=symbol, qty=0, avg_price=0, total_cost=0)
+        session.add(basis)
+
+    new_cost = qty_change * price
+    basis.qty += qty_change
+    basis.total_cost += new_cost
+    basis.avg_price = basis.total_cost / basis.qty if basis.qty > 0 else 0
+    basis.last_updated = datetime.utcnow()
+
+
+def record_realized_trade(session, symbol, qty_sold, exit_price, buy_order_id=None, sell_order_id=None):
+    """
+    Record a realized trade when a position is closed (sold).
+
+    Computes P&L from cost basis and creates a Trade record.
+
+    Args:
+        session: DB session.
+        symbol: Ticker symbol.
+        qty_sold: Shares sold (positive number).
+        exit_price: Sell fill price.
+        buy_order_id: Original buy order id (if known).
+        sell_order_id: Sell order id.
+
+    Returns:
+        Trade dict with realized P&L.
+    """
+    basis = session.query(CostBasis).filter(CostBasis.symbol == symbol).first()
+
+    if basis is None or basis.qty <= 0:
+        entry_price = exit_price  # No basis — assume breakeven
+    else:
+        entry_price = basis.avg_price
+
+    realized_pnl = (exit_price - entry_price) * qty_sold
+    realized_pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+
+    trade = Trade(
+        symbol=symbol,
+        buy_order_id=buy_order_id,
+        sell_order_id=sell_order_id,
+        qty=qty_sold,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        realized_pnl=realized_pnl,
+        realized_pnl_pct=round(realized_pnl_pct, 4),
+        is_win=realized_pnl > 0,
+        exit_date=datetime.utcnow(),
+    )
+    session.add(trade)
+
+    # Update cost basis — reduce qty
+    if basis is not None:
+        basis.qty -= qty_sold
+        basis.total_cost = basis.qty * basis.avg_price if basis.qty > 0 else 0
+        if basis.qty <= 0:
+            basis.qty = 0
+            basis.avg_price = 0
+            basis.total_cost = 0
+        basis.last_updated = datetime.utcnow()
+
+    logger.info(
+        f"Trade recorded: {symbol} sold {qty_sold:.6f} @ ${exit_price:.2f}, "
+        f"P&L: ${realized_pnl:+.2f} ({realized_pnl_pct:+.2f}%)",
+        extra={
+            "extra_data": {
+                "symbol": symbol,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "realized_pnl": realized_pnl,
+                "is_win": realized_pnl > 0,
+            }
+        },
+    )
+
+    return {
+        "symbol": symbol,
+        "qty": qty_sold,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "realized_pnl": realized_pnl,
+        "realized_pnl_pct": realized_pnl_pct,
+        "is_win": realized_pnl > 0,
+    }
+
+
+def get_trade_performance(session):
+    """
+    Compute win rate and profit factor from realized trades.
+
+    Returns:
+        Dict with:
+        - total_trades: int
+        - wins: int
+        - losses: int
+        - win_rate: float (0-1)
+        - profit_factor: float (gross_profit / gross_loss)
+        - total_pnl: float
+    """
+    trades = session.query(Trade).all()
+
+    if not trades:
+        return {
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0,
+            "profit_factor": 0,
+            "total_pnl": 0,
+        }
+
+    wins = [t for t in trades if t.is_win]
+    losses = [t for t in trades if not t.is_win]
+    gross_profit = sum(t.realized_pnl for t in wins)
+    gross_loss = abs(sum(t.realized_pnl for t in losses))
+
+    return {
+        "total_trades": len(trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": len(wins) / len(trades),
+        "profit_factor": gross_profit / gross_loss if gross_loss > 0 else float("inf"),
+        "total_pnl": sum(t.realized_pnl for t in trades),
+    }
+
+
+def update_position(session, symbol, qty_change, price, current_state, buy_order_id=None, sell_order_id=None):
+    """
+    Update a position after a fill. Tracks cost basis and realized P&L.
 
     Args:
         session: DB session.
@@ -341,6 +481,8 @@ def update_position(session, symbol, qty_change, price, current_state):
         qty_change: Positive for buy, negative for sell.
         price: Fill price.
         current_state: Current portfolio state dict.
+        buy_order_id: Order id for buy fills.
+        sell_order_id: Order id for sell fills.
 
     Returns:
         Updated portfolio state dict.
@@ -353,11 +495,16 @@ def update_position(session, symbol, qty_change, price, current_state):
     trade_value = abs(qty_change) * price
 
     if qty_change > 0:
-        # Buy — reduce cash
+        # Buy — reduce cash, update cost basis
         cash -= trade_value
+        update_cost_basis(session, symbol, qty_change, price)
     else:
-        # Sell — increase cash
+        # Sell — increase cash, record realized P&L
         cash += trade_value
+        record_realized_trade(
+            session, symbol, abs(qty_change), price,
+            buy_order_id=buy_order_id, sell_order_id=sell_order_id,
+        )
 
     if new_qty <= 0:
         positions.pop(symbol, None)

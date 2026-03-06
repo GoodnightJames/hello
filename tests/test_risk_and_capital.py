@@ -136,13 +136,24 @@ class TestCapitalManager:
 
 class TestCalculateShares:
     def test_basic_calculation(self):
-        assert calculate_shares(500, 100) == 5
+        assert calculate_shares(500, 100) == pytest.approx(5.0)
 
-    def test_fractional_truncated(self):
-        assert calculate_shares(550, 100) == 5
+    def test_fractional_shares(self):
+        # $550 / $100 = 5.5 shares (fractional by default)
+        assert calculate_shares(550, 100) == pytest.approx(5.5)
 
-    def test_insufficient_funds(self):
-        assert calculate_shares(5, 450) == 0
+    def test_whole_shares_mode(self):
+        # With fractional=False, truncates to whole shares
+        assert calculate_shares(550, 100, fractional=False) == 5
+
+    def test_small_amount_fractional(self):
+        # $100 / $550 = 0.181818 shares — fractional makes this possible
+        result = calculate_shares(100, 550)
+        assert result == pytest.approx(0.181818, abs=0.001)
+
+    def test_below_min_notional(self):
+        # Below $1 minimum notional
+        assert calculate_shares(0.50, 450) == 0
 
     def test_zero_price(self):
         assert calculate_shares(500, 0) == 0

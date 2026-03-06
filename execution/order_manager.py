@@ -20,24 +20,37 @@ from data.db import Order, get_session
 logger = get_logger("execution.order_manager")
 
 
-def calculate_shares(dollar_amount, price, min_shares=1):
+def calculate_shares(dollar_amount, price, fractional=True, min_notional=1.0):
     """
-    Convert a dollar allocation to whole shares.
+    Convert a dollar allocation to shares (fractional or whole).
+
+    Alpaca supports fractional shares down to $1. For a $100/week
+    account, fractional shares are essential — $100 can't buy a
+    whole share of SPY at $550+.
 
     Args:
         dollar_amount: Dollar amount to invest.
         price: Current price per share.
-        min_shares: Minimum shares to buy (default 1).
+        fractional: If True, return fractional qty (default True).
+        min_notional: Minimum dollar value of trade (default $1).
 
     Returns:
-        Integer number of shares (0 if insufficient funds).
+        Float number of shares (0 if below min_notional).
     """
     if price <= 0 or dollar_amount <= 0:
         return 0
 
-    shares = int(dollar_amount / price)
-    if shares < min_shares:
+    if dollar_amount < min_notional:
         return 0
+
+    if fractional:
+        # Round to 6 decimal places (Alpaca's precision)
+        shares = round(dollar_amount / price, 6)
+    else:
+        shares = int(dollar_amount / price)
+        if shares < 1:
+            return 0
+
     return shares
 
 

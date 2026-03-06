@@ -105,9 +105,13 @@ def submit_market_order(symbol, qty, side):
     """
     Submit a market order to Alpaca paper trading.
 
+    Supports fractional shares. If qty has decimals, uses fractional
+    order mode. This is critical for small accounts — $100 can't buy
+    a whole share of SPY.
+
     Args:
         symbol: Ticker symbol (e.g., "SPY").
-        qty: Number of shares (integer).
+        qty: Number of shares (float — fractional allowed).
         side: "buy" or "sell".
 
     Returns:
@@ -117,12 +121,24 @@ def submit_market_order(symbol, qty, side):
 
     order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
-    request = MarketOrderRequest(
-        symbol=symbol,
-        qty=int(qty),
-        side=order_side,
-        time_in_force=TimeInForce.DAY,
-    )
+    # Use fractional qty if not a whole number
+    qty_float = float(qty)
+    if qty_float == int(qty_float):
+        # Whole shares
+        request = MarketOrderRequest(
+            symbol=symbol,
+            qty=int(qty_float),
+            side=order_side,
+            time_in_force=TimeInForce.DAY,
+        )
+    else:
+        # Fractional shares
+        request = MarketOrderRequest(
+            symbol=symbol,
+            qty=round(qty_float, 6),
+            side=order_side,
+            time_in_force=TimeInForce.DAY,
+        )
 
     order = client.submit_order(request)
 
@@ -130,14 +146,14 @@ def submit_market_order(symbol, qty, side):
         "broker_order_id": str(order.id),
         "symbol": order.symbol,
         "side": side,
-        "qty": int(qty),
+        "qty": qty_float,
         "status": order.status.value if hasattr(order.status, 'value') else str(order.status),
         "submitted_at": str(order.submitted_at),
         "type": "market",
     }
 
     logger.info(
-        f"Order submitted: {side} {qty} {symbol}",
+        f"Order submitted: {side} {qty_float:.6f} {symbol}",
         extra={"extra_data": result},
     )
     return result

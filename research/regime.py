@@ -177,6 +177,43 @@ def get_position_size_multiplier(trend_regime, vol_regime, risk_params=None):
     return multiplier
 
 
+def _estimate_vix_from_spy(features):
+    """
+    Estimate VIX-equivalent from SPY realized volatility.
+
+    VIX measures 30-day implied vol. We approximate using 20-day
+    realized vol of SPY, annualized. This isn't perfect but is
+    directionally correct — when SPY is volatile, this goes up.
+
+    The VIX typically trades at a premium to realized vol, so we
+    apply a 1.2x multiplier to better match VIX levels.
+
+    Returns:
+        Float VIX estimate, or None if insufficient data.
+    """
+    prices = features.get("prices", None)
+    if prices is None or prices.empty or "SPY" not in prices.columns:
+        return None
+
+    spy = prices["SPY"].dropna()
+    if len(spy) < 21:
+        return None
+
+    # 20-day realized vol, annualized
+    returns = spy.pct_change().dropna().tail(20)
+    if len(returns) < 10:
+        return None
+
+    realized_vol = returns.std() * (252 ** 0.5) * 100  # Annualized, in VIX units
+    vix_estimate = realized_vol * 1.2  # Premium adjustment
+
+    logger.info(
+        f"VIX proxy: {vix_estimate:.1f} (from 20d realized vol {realized_vol:.1f})",
+        extra={"extra_data": {"realized_vol": realized_vol, "vix_estimate": vix_estimate}},
+    )
+    return vix_estimate
+
+
 def classify_regime(features, risk_params=None):
     """
     Full regime classification — convenience function combining all checks.
@@ -213,9 +250,10 @@ def classify_regime(features, risk_params=None):
             "above_200d": False,
         }
 
-    # Volatility regime (VIX — use VIXY or ^VIX proxy if available)
+    # Volatility regime — estimate from realized volatility of SPY
+    vix_proxy = _estimate_vix_from_spy(features)
     vol = classify_volatility_regime(
-        vix_price=None,  # VIX integration in v1.5
+        vix_price=vix_proxy,
         vix_threshold=risk_params.get("regime_throttles", {}).get("vix_threshold", 30),
     )
 

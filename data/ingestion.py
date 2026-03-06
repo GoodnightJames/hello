@@ -104,7 +104,11 @@ def fetch_daily_bars(client, symbols, start_date, end_date):
 
 def store_bars(df, session):
     """
-    Store daily bars DataFrame to database. Skips duplicates.
+    Store daily bars DataFrame to database. Skips duplicates using batch check.
+
+    Instead of checking each row individually (N queries), fetches all existing
+    (symbol, date) pairs in one query, then bulk-inserts only new rows.
+    On a 365-day backfill of 24 symbols this reduces 8,760 queries to 1.
 
     Args:
         df: DataFrame with columns: symbol, timestamp, open, high, low, close, volume, vwap, trade_count.
@@ -117,30 +121,41 @@ def store_bars(df, session):
         logger.info("No bars to store")
         return 0
 
-    inserted = 0
-    skipped = 0
+    # Filter rows with valid symbol/timestamp
+    valid = df.dropna(subset=["symbol", "timestamp"])
+    if valid.empty:
+        logger.info("No valid bars to store")
+        return 0
 
-    for _, row in df.iterrows():
-        symbol = row.get("symbol", None)
-        timestamp = row.get("timestamp", None)
+    # Batch-check existing records (single query instead of N queries)
+    symbols_in_batch = valid["symbol"].unique().tolist()
+    dates_in_batch = valid["timestamp"].unique().tolist()
 
-        if symbol is None or timestamp is None:
-            skipped += 1
-            continue
-
-        # Check for existing record
-        exists = (
-            session.query(DailyBar)
-            .filter(DailyBar.symbol == symbol, DailyBar.date == timestamp)
-            .first()
+    existing = set()
+    # Query in chunks to avoid SQL parameter limits
+    chunk_size = 500
+    for i in range(0, len(dates_in_batch), chunk_size):
+        date_chunk = dates_in_batch[i:i + chunk_size]
+        rows = (
+            session.query(DailyBar.symbol, DailyBar.date)
+            .filter(
+                DailyBar.symbol.in_(symbols_in_batch),
+                DailyBar.date.in_(date_chunk),
+            )
+            .all()
         )
-        if exists:
-            skipped += 1
+        existing.update((r[0], r[1]) for r in rows)
+
+    # Build list of new bars
+    new_bars = []
+    for _, row in valid.iterrows():
+        key = (row["symbol"], row["timestamp"])
+        if key in existing:
             continue
 
-        bar = DailyBar(
-            symbol=symbol,
-            date=timestamp,
+        new_bars.append(DailyBar(
+            symbol=row["symbol"],
+            date=row["timestamp"],
             open=float(row.get("open", 0)),
             high=float(row.get("high", 0)),
             low=float(row.get("low", 0)),
@@ -148,16 +163,19 @@ def store_bars(df, session):
             volume=float(row.get("volume", 0)),
             vwap=float(row["vwap"]) if pd.notna(row.get("vwap")) else None,
             trade_count=int(row["trade_count"]) if pd.notna(row.get("trade_count")) else None,
-        )
-        session.add(bar)
-        inserted += 1
+        ))
 
-    session.commit()
+    # Bulk insert
+    if new_bars:
+        session.add_all(new_bars)
+        session.commit()
+
+    skipped = len(valid) - len(new_bars)
     logger.info(
         "Stored bars to database",
-        extra={"extra_data": {"inserted": inserted, "skipped": skipped}},
+        extra={"extra_data": {"inserted": len(new_bars), "skipped": skipped}},
     )
-    return inserted
+    return len(new_bars)
 
 
 def get_last_bar_date(session, symbol=None):

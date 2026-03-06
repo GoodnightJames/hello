@@ -196,9 +196,12 @@ def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
 
             results.append(result)
 
-            # Refresh portfolio state from Alpaca after each fill
-            portfolio = sync_portfolio_from_alpaca(session)
+            # Update portfolio locally from fill data (no API call)
+            # The position was already updated in the buy/sell handler
+            portfolio = get_or_create_portfolio(session)
 
+        # Single final sync from Alpaca after all orders are done
+        sync_portfolio_from_alpaca(session)
         session.commit()
 
         logger.info(
@@ -250,7 +253,7 @@ def _execute_alpaca_buy(session, decision, portfolio, prices, risk_result):
     max_trade = risk_result.get("max_trade_size", deployable)
     allocation = min(deployable, max_trade) * multiplier
 
-    shares = calculate_shares(allocation, price)
+    shares = calculate_shares(allocation, price, fractional=True, min_notional=1.0)
     if shares <= 0:
         logger.info(f"Insufficient funds for {symbol} at ${price:.2f}")
         return {
@@ -274,14 +277,14 @@ def _execute_alpaca_buy(session, decision, portfolio, prices, risk_result):
 
         if fill_status and fill_status["status"] == "filled":
             filled_price = fill_status["filled_avg_price"] or price
-            filled_qty = int(fill_status["filled_qty"]) or shares
+            filled_qty = float(fill_status["filled_qty"]) or shares
 
             mark_order_filled(session, order["id"], filled_price=filled_price, filled_qty=filled_qty)
             update_position(session, symbol, qty_change=filled_qty, price=filled_price, current_state=portfolio)
 
             total_cost = filled_qty * filled_price
             logger.info(
-                f"Alpaca BUY filled: {filled_qty} {symbol} @ ${filled_price:.2f} = ${total_cost:.2f}",
+                f"Alpaca BUY filled: {filled_qty:.6f} {symbol} @ ${filled_price:.2f} = ${total_cost:.2f}",
                 extra={"extra_data": {"order_id": order["id"], "broker_order_id": broker_order_id}},
             )
 
@@ -337,7 +340,7 @@ def _execute_alpaca_sell(session, decision, portfolio):
             "reason": "No position to sell",
         }
 
-    shares = int(current_qty)
+    shares = float(current_qty)
     order = create_order(session, decision, shares)
 
     try:
@@ -350,7 +353,7 @@ def _execute_alpaca_sell(session, decision, portfolio):
 
         if fill_status and fill_status["status"] == "filled":
             filled_price = fill_status["filled_avg_price"] or 0
-            filled_qty = int(fill_status["filled_qty"]) or shares
+            filled_qty = float(fill_status["filled_qty"]) or shares
 
             mark_order_filled(session, order["id"], filled_price=filled_price, filled_qty=filled_qty)
             update_position(session, symbol, qty_change=-filled_qty, price=filled_price, current_state=portfolio)

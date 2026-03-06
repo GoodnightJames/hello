@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 import yaml
 
 from core.logging import get_logger
-from data.db import RiskEvent, Order, PortfolioState, get_session, init_db
+from data.db import RiskEvent, Order, PortfolioState, Trade, get_session, init_db
 
 logger = get_logger("risk.enforcer")
 
@@ -156,43 +156,52 @@ def check_weekly_drawdown(session, risk_params):
 
 def check_consecutive_losses(session, risk_params):
     """
-    Check if the last N fills were all losses.
+    Check if the last N realized trades were all losses.
+
+    Uses the Trade table which tracks realized P&L per round-trip.
 
     Returns:
         (bool, dict) — (is_breached, details)
     """
-    max_consecutive = risk_params.get("shutdown_rules", {}).get("consecutive_loss_shutdown", 3)
+    max_consecutive = risk_params.get("shutdown_rules", {}).get("consecutive_loss_shutdown", 5)
 
-    # Get the most recent filled sell orders (realized trades)
-    recent_orders = (
-        session.query(Order)
-        .filter(Order.status == "filled", Order.side == "sell")
-        .order_by(Order.filled_at.desc())
+    # Get the most recent realized trades
+    recent_trades = (
+        session.query(Trade)
+        .order_by(Trade.exit_date.desc())
         .limit(max_consecutive)
         .all()
     )
 
-    if len(recent_orders) < max_consecutive:
-        return False, {"reason": f"Only {len(recent_orders)} filled sells — need {max_consecutive} to check"}
+    if len(recent_trades) < max_consecutive:
+        return False, {
+            "reason": f"Only {len(recent_trades)} realized trades — need {max_consecutive} to check",
+            "consecutive_losses": 0,
+            "limit": max_consecutive,
+        }
 
-    # For each sell, check if it was a loss by comparing fill price to the
-    # original buy price. This is simplified — a full implementation would
-    # track cost basis per position.
-    # For now, we check if the filled_price trend is declining.
+    # Count consecutive losses from most recent
     consecutive_losses = 0
-    for order in recent_orders:
-        # In a paper trading context, we mark orders with P&L metadata
-        # For now, check if we have loss markers
-        if order.filled_price is not None and order.filled_qty is not None:
-            consecutive_losses += 1  # Placeholder — full P&L tracking in Phase 4
+    for trade in recent_trades:
+        if not trade.is_win:
+            consecutive_losses += 1
+        else:
+            break  # First win breaks the streak
 
     details = {
         "consecutive_losses": consecutive_losses,
         "limit": max_consecutive,
-        "recent_sells": len(recent_orders),
+        "recent_trades": len(recent_trades),
     }
 
-    # This will be fully implemented when we have proper P&L tracking
+    if consecutive_losses >= max_consecutive:
+        logger.warning(
+            f"CONSECUTIVE LOSS LIMIT: {consecutive_losses} losses in a row",
+            extra={"extra_data": details},
+        )
+        log_risk_event(session, "consecutive_loss_shutdown", "CRITICAL", details)
+        return True, details
+
     return False, details
 
 

@@ -155,6 +155,54 @@ class ParamVersion(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class Trade(Base):
+    """Realized round-trip trades — tracks P&L per closed position.
+
+    A Trade is created when a sell order closes (fully or partially) a position.
+    It links the buy and sell fills to compute realized P&L.
+    """
+
+    __tablename__ = "trades"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(10), nullable=False)
+    buy_order_id = Column(Integer, nullable=True)
+    sell_order_id = Column(Integer, nullable=True)
+    qty = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)          # avg cost basis
+    exit_price = Column(Float, nullable=False)            # fill price on sell
+    realized_pnl = Column(Float, nullable=False)          # exit - entry, in dollars
+    realized_pnl_pct = Column(Float, nullable=False)      # as percentage
+    is_win = Column(Boolean, nullable=False)              # True if pnl > 0
+    entry_date = Column(DateTime, nullable=True)
+    exit_date = Column(DateTime, nullable=True)
+    holding_days = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_trades_symbol", "symbol"),
+        Index("ix_trades_exit_date", "exit_date"),
+    )
+
+
+class CostBasis(Base):
+    """Per-symbol cost basis tracking for open positions.
+
+    Updated on every buy fill. Used to compute realized P&L on sells.
+    """
+
+    __tablename__ = "cost_basis"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(10), nullable=False, unique=True)
+    qty = Column(Float, nullable=False, default=0)
+    avg_price = Column(Float, nullable=False, default=0)     # weighted avg entry
+    total_cost = Column(Float, nullable=False, default=0)     # qty * avg_price
+    last_updated = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (Index("ix_cost_basis_symbol", "symbol"),)
+
+
 class Deposit(Base):
     """Weekly deposit log."""
 

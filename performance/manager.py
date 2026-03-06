@@ -17,7 +17,7 @@ Mode transitions are slow and capped — no doubling after a win.
 from datetime import datetime, timedelta
 
 from core.logging import get_logger
-from data.db import PortfolioState, Order, RiskEvent
+from data.db import PortfolioState, Order, RiskEvent, Trade
 
 logger = get_logger("performance.manager")
 
@@ -126,32 +126,30 @@ def compute_current_drawdown(equity_curve):
 
 def count_consecutive_losses(session, max_check=10):
     """
-    Count consecutive losing sell orders (most recent first).
+    Count consecutive losing trades (most recent first).
 
-    A sell is a "loss" if its filled_price * filled_qty < the average
-    entry price (approximated by tracking cost basis).  For simplicity,
-    we count consecutive sells where P&L metadata indicates a loss.
+    Uses the Trade table which tracks realized P&L per round-trip.
 
     Returns:
         Int — number of consecutive losses from the most recent trade.
     """
-    recent_orders = (
-        session.query(Order)
-        .filter(Order.status == "filled", Order.side == "sell")
-        .order_by(Order.filled_at.desc())
+    recent_trades = (
+        session.query(Trade)
+        .order_by(Trade.exit_date.desc())
         .limit(max_check)
         .all()
     )
 
-    # For now, we track losses via a simple heuristic:
-    # If the order has a filled_price and the order's metadata
-    # (stored as part of the decision chain) marks it as a loss.
-    # In the initial paper-trading phase, every closed trade is logged
-    # with its realized P&L.  We'll count negative returns.
-    #
-    # Until we have full P&L tracking, return 0 (safe default).
-    # This will be upgraded when the paper executor logs realized P&L.
-    return 0
+    if not recent_trades:
+        return 0
+
+    consecutive = 0
+    for trade in recent_trades:
+        if not trade.is_win:
+            consecutive += 1
+        else:
+            break
+    return consecutive
 
 
 def count_trades_this_week(session):
