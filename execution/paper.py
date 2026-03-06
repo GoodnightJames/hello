@@ -1,16 +1,20 @@
 """
-Paper Execution Engine — simulated order fills for paper trading.
+Paper Execution Engine — submits orders to Alpaca paper trading API.
 
-In paper mode:
-- BUY orders fill at the latest close price
-- SELL orders fill at the latest close price
-- All fills are instant (no slippage, no partial fills)
-- Portfolio state is updated after each fill
+Pipeline for each decision:
+1. Get current portfolio state (from Alpaca account)
+2. Run risk validation
+3. Calculate share quantity
+4. Submit market order to Alpaca
+5. Poll for fill confirmation
+6. Record order in local database
+7. Update local portfolio state
 
-This runs during the paper trading phase before live execution is enabled.
+This uses real Alpaca paper trading — orders execute against
+the market simulation at realistic prices with proper fills.
 """
 
-import json
+import time
 from datetime import datetime
 
 import yaml
@@ -21,7 +25,7 @@ from data.feature_store import get_price_history
 from capital.manager import (
     get_or_create_portfolio,
     update_position,
-    calculate_strategy_allocation,
+    save_portfolio_snapshot,
 )
 from risk.enforcer import load_risk_params, validate_order
 from execution.order_manager import (
@@ -31,20 +35,24 @@ from execution.order_manager import (
     mark_order_filled,
     mark_order_rejected,
 )
+from execution.alpaca_broker import (
+    submit_market_order,
+    get_order_status,
+    get_account,
+    get_positions as get_alpaca_positions,
+)
 
 logger = get_logger("execution.paper")
+
+# Max time to wait for an order to fill (seconds)
+ORDER_FILL_TIMEOUT = 30
+ORDER_POLL_INTERVAL = 1
 
 
 def get_latest_prices(symbols, session=None):
     """
-    Get the most recent close price for each symbol.
-
-    Args:
-        symbols: List of ticker symbols.
-        session: DB session.
-
-    Returns:
-        Dict of {symbol: latest_close_price}.
+    Get the most recent close price for each symbol from local data.
+    Used for pre-trade sizing only — actual fills come from Alpaca.
     """
     prices_df = get_price_history(symbols, lookback_days=5, session=session)
     if prices_df.empty:
@@ -54,18 +62,68 @@ def get_latest_prices(symbols, session=None):
     return {symbol: float(latest[symbol]) for symbol in latest.index if latest[symbol] > 0}
 
 
+def sync_portfolio_from_alpaca(session):
+    """
+    Sync local portfolio state from Alpaca account.
+
+    Returns:
+        Portfolio state dict matching the format expected by other modules.
+    """
+    account = get_account()
+    positions = get_alpaca_positions()
+
+    # Convert to local format: {symbol: qty}
+    position_qtys = {sym: int(pos["qty"]) for sym, pos in positions.items()}
+    prices = {sym: pos["current_price"] for sym, pos in positions.items()}
+
+    snapshot = save_portfolio_snapshot(
+        session,
+        cash=account["cash"],
+        positions=position_qtys,
+        prices=prices,
+    )
+
+    logger.info(
+        "Portfolio synced from Alpaca",
+        extra={
+            "extra_data": {
+                "alpaca_equity": account["equity"],
+                "alpaca_cash": account["cash"],
+                "local_equity": snapshot["total_equity"],
+                "positions": len(position_qtys),
+            }
+        },
+    )
+    return snapshot
+
+
+def wait_for_fill(broker_order_id, timeout=ORDER_FILL_TIMEOUT):
+    """
+    Poll Alpaca for order fill status.
+
+    Returns:
+        Order status dict, or None if timeout.
+    """
+    elapsed = 0
+    while elapsed < timeout:
+        status = get_order_status(broker_order_id)
+        if status["status"] in ("filled", "partially_filled"):
+            return status
+        if status["status"] in ("canceled", "cancelled", "expired", "rejected"):
+            return status
+        time.sleep(ORDER_POLL_INTERVAL)
+        elapsed += ORDER_POLL_INTERVAL
+
+    logger.warning(
+        f"Order fill timeout after {timeout}s",
+        extra={"extra_data": {"broker_order_id": broker_order_id}},
+    )
+    return get_order_status(broker_order_id)
+
+
 def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
     """
-    Execute a list of decisions in paper trading mode.
-
-    Pipeline for each decision:
-    1. Get current portfolio state
-    2. Get latest prices
-    3. Run risk validation
-    4. Calculate share quantity
-    5. Create order
-    6. Simulate fill at latest close
-    7. Update portfolio state
+    Execute a list of decisions via Alpaca paper trading API.
 
     Args:
         decisions: List of decision dicts from decision engine.
@@ -75,7 +133,7 @@ def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
         List of execution result dicts.
     """
     logger.info(
-        "Paper execution starting",
+        "Paper execution starting (Alpaca)",
         extra={"extra_data": {"decision_count": len(decisions)}},
     )
 
@@ -85,9 +143,10 @@ def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
     results = []
 
     try:
-        portfolio = get_or_create_portfolio(session)
+        # Sync portfolio from Alpaca before executing
+        portfolio = sync_portfolio_from_alpaca(session)
 
-        # Collect symbols we need prices for
+        # Collect symbols we need prices for (pre-trade sizing)
         symbols = list(set(d["symbol"] for d in decisions if d.get("action") in ("BUY", "SELL")))
         if not symbols:
             logger.info("No actionable decisions (all HOLD/SKIP)")
@@ -95,8 +154,7 @@ def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
 
         prices = get_latest_prices(symbols, session=session)
         if not prices:
-            logger.warning("No price data available for paper execution")
-            return results
+            logger.warning("No price data available for sizing — using Alpaca positions for sells")
 
         for decision in decisions:
             action = decision.get("action")
@@ -109,17 +167,6 @@ def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
                     "action": action,
                     "status": "skipped",
                     "reason": decision.get("reason", ""),
-                })
-                continue
-
-            price = prices.get(symbol)
-            if price is None or price <= 0:
-                logger.warning(f"No price for {symbol} — skipping")
-                results.append({
-                    "symbol": symbol,
-                    "action": action,
-                    "status": "skipped",
-                    "reason": "No price data available",
                 })
                 continue
 
@@ -139,18 +186,18 @@ def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
                 continue
 
             if action == "BUY":
-                result = _execute_paper_buy(
-                    session, decision, portfolio, price, risk_result, risk_params
+                result = _execute_alpaca_buy(
+                    session, decision, portfolio, prices, risk_result
                 )
             elif action == "SELL":
-                result = _execute_paper_sell(session, decision, portfolio, price)
+                result = _execute_alpaca_sell(session, decision, portfolio)
             else:
                 result = {"symbol": symbol, "action": action, "status": "unknown"}
 
             results.append(result)
 
-            # Refresh portfolio state after each fill
-            portfolio = get_or_create_portfolio(session)
+            # Refresh portfolio state from Alpaca after each fill
+            portfolio = sync_portfolio_from_alpaca(session)
 
         session.commit()
 
@@ -179,13 +226,22 @@ def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
         session.close()
 
 
-def _execute_paper_buy(session, decision, portfolio, price, risk_result, risk_params):
-    """Execute a paper BUY order."""
+def _execute_alpaca_buy(session, decision, portfolio, prices, risk_result):
+    """Execute a BUY order via Alpaca paper trading."""
     symbol = decision["symbol"]
     multiplier = decision.get("position_multiplier", 1.0)
 
-    # Calculate allocation: strategy allocation * regime multiplier
-    # Capped by risk max trade size
+    price = prices.get(symbol)
+    if price is None or price <= 0:
+        logger.warning(f"No price for {symbol} — skipping buy")
+        return {
+            "symbol": symbol,
+            "action": "BUY",
+            "status": "skipped",
+            "reason": "No price data available for sizing",
+        }
+
+    # Calculate allocation
     strategy_allocation = portfolio["cash"] * 0.90  # Keep 10% cash buffer
     max_trade = risk_result.get("max_trade_size", strategy_allocation)
     allocation = min(strategy_allocation, max_trade) * multiplier
@@ -200,40 +256,70 @@ def _execute_paper_buy(session, decision, portfolio, price, risk_result, risk_pa
             "reason": f"Insufficient funds: ${allocation:.2f} for {symbol} at ${price:.2f}",
         }
 
-    # Create and fill order
+    # Create local order record
     order = create_order(session, decision, shares)
-    mark_order_submitted(session, order["id"], broker_order_id=f"PAPER-{order['id']}")
-    mark_order_filled(session, order["id"], filled_price=price, filled_qty=shares)
 
-    # Update portfolio
-    update_position(session, symbol, qty_change=shares, price=price, current_state=portfolio)
+    # Submit to Alpaca
+    try:
+        alpaca_order = submit_market_order(symbol, shares, "buy")
+        broker_order_id = alpaca_order["broker_order_id"]
+        mark_order_submitted(session, order["id"], broker_order_id=broker_order_id)
 
-    total_cost = shares * price
-    logger.info(
-        f"Paper BUY filled: {shares} {symbol} @ ${price:.2f} = ${total_cost:.2f}",
-        extra={
-            "extra_data": {
-                "order_id": order["id"],
-                "shares": shares,
-                "price": price,
+        # Wait for fill
+        fill_status = wait_for_fill(broker_order_id)
+
+        if fill_status and fill_status["status"] == "filled":
+            filled_price = fill_status["filled_avg_price"] or price
+            filled_qty = int(fill_status["filled_qty"]) or shares
+
+            mark_order_filled(session, order["id"], filled_price=filled_price, filled_qty=filled_qty)
+            update_position(session, symbol, qty_change=filled_qty, price=filled_price, current_state=portfolio)
+
+            total_cost = filled_qty * filled_price
+            logger.info(
+                f"Alpaca BUY filled: {filled_qty} {symbol} @ ${filled_price:.2f} = ${total_cost:.2f}",
+                extra={"extra_data": {"order_id": order["id"], "broker_order_id": broker_order_id}},
+            )
+
+            return {
+                "symbol": symbol,
+                "action": "BUY",
+                "status": "filled",
+                "shares": filled_qty,
+                "price": filled_price,
                 "total_cost": total_cost,
+                "order_id": order["id"],
+                "broker_order_id": broker_order_id,
             }
-        },
-    )
+        else:
+            status_str = fill_status["status"] if fill_status else "timeout"
+            mark_order_rejected(session, order["id"], reason=f"Alpaca: {status_str}")
+            return {
+                "symbol": symbol,
+                "action": "BUY",
+                "status": "rejected",
+                "reason": f"Order not filled: {status_str}",
+                "order_id": order["id"],
+            }
 
-    return {
-        "symbol": symbol,
-        "action": "BUY",
-        "status": "filled",
-        "shares": shares,
-        "price": price,
-        "total_cost": total_cost,
-        "order_id": order["id"],
-    }
+    except Exception as e:
+        mark_order_rejected(session, order["id"], reason=str(e))
+        logger.error(
+            f"Alpaca BUY failed: {symbol}",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+        return {
+            "symbol": symbol,
+            "action": "BUY",
+            "status": "rejected",
+            "reason": f"Alpaca API error: {str(e)}",
+            "order_id": order["id"],
+        }
 
 
-def _execute_paper_sell(session, decision, portfolio, price):
-    """Execute a paper SELL order."""
+def _execute_alpaca_sell(session, decision, portfolio):
+    """Execute a SELL order via Alpaca paper trading."""
     symbol = decision["symbol"]
     positions = portfolio.get("positions", {})
     current_qty = positions.get(symbol, 0)
@@ -247,52 +333,77 @@ def _execute_paper_sell(session, decision, portfolio, price):
             "reason": "No position to sell",
         }
 
-    # Sell entire position
-    shares = current_qty
+    shares = int(current_qty)
     order = create_order(session, decision, shares)
-    mark_order_submitted(session, order["id"], broker_order_id=f"PAPER-{order['id']}")
-    mark_order_filled(session, order["id"], filled_price=price, filled_qty=shares)
 
-    # Update portfolio
-    update_position(session, symbol, qty_change=-shares, price=price, current_state=portfolio)
+    try:
+        alpaca_order = submit_market_order(symbol, shares, "sell")
+        broker_order_id = alpaca_order["broker_order_id"]
+        mark_order_submitted(session, order["id"], broker_order_id=broker_order_id)
 
-    total_proceeds = shares * price
-    logger.info(
-        f"Paper SELL filled: {shares} {symbol} @ ${price:.2f} = ${total_proceeds:.2f}",
-        extra={
-            "extra_data": {
-                "order_id": order["id"],
-                "shares": shares,
-                "price": price,
+        # Wait for fill
+        fill_status = wait_for_fill(broker_order_id)
+
+        if fill_status and fill_status["status"] == "filled":
+            filled_price = fill_status["filled_avg_price"] or 0
+            filled_qty = int(fill_status["filled_qty"]) or shares
+
+            mark_order_filled(session, order["id"], filled_price=filled_price, filled_qty=filled_qty)
+            update_position(session, symbol, qty_change=-filled_qty, price=filled_price, current_state=portfolio)
+
+            total_proceeds = filled_qty * filled_price
+            logger.info(
+                f"Alpaca SELL filled: {filled_qty} {symbol} @ ${filled_price:.2f} = ${total_proceeds:.2f}",
+                extra={"extra_data": {"order_id": order["id"], "broker_order_id": broker_order_id}},
+            )
+
+            return {
+                "symbol": symbol,
+                "action": "SELL",
+                "status": "filled",
+                "shares": filled_qty,
+                "price": filled_price,
                 "total_proceeds": total_proceeds,
+                "order_id": order["id"],
+                "broker_order_id": broker_order_id,
             }
-        },
-    )
+        else:
+            status_str = fill_status["status"] if fill_status else "timeout"
+            mark_order_rejected(session, order["id"], reason=f"Alpaca: {status_str}")
+            return {
+                "symbol": symbol,
+                "action": "SELL",
+                "status": "rejected",
+                "reason": f"Order not filled: {status_str}",
+                "order_id": order["id"],
+            }
 
-    return {
-        "symbol": symbol,
-        "action": "SELL",
-        "status": "filled",
-        "shares": shares,
-        "price": price,
-        "total_proceeds": total_proceeds,
-        "order_id": order["id"],
-    }
+    except Exception as e:
+        mark_order_rejected(session, order["id"], reason=str(e))
+        logger.error(
+            f"Alpaca SELL failed: {symbol}",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+        return {
+            "symbol": symbol,
+            "action": "SELL",
+            "status": "rejected",
+            "reason": f"Alpaca API error: {str(e)}",
+            "order_id": order["id"],
+        }
 
 
 if __name__ == "__main__":
-    # For manual testing
-    test_decisions = [
-        {
-            "symbol": "SPY",
-            "action": "BUY",
-            "signal_type": "BUY",
-            "signal_id": None,
-            "position_multiplier": 1.0,
-            "risk_approved": True,
-            "reason": "Test BUY",
-        }
-    ]
-    results = execute_paper_decisions(test_decisions)
-    for r in results:
-        print(f"  {r['action']:5s} {r['symbol']:5s} — {r['status']}")
+    # Quick connectivity test — fetches account info
+    from execution.alpaca_broker import get_account, get_positions
+    print("Testing Alpaca connection...")
+    acct = get_account()
+    print(f"  Account status: {acct['status']}")
+    print(f"  Cash: ${acct['cash']:,.2f}")
+    print(f"  Equity: ${acct['equity']:,.2f}")
+    print(f"  Buying Power: ${acct['buying_power']:,.2f}")
+    pos = get_positions()
+    print(f"  Open positions: {len(pos)}")
+    for sym, p in pos.items():
+        print(f"    {sym}: {p['qty']} shares @ ${p['current_price']:.2f}")

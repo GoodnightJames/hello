@@ -34,6 +34,7 @@ from execution.paper import execute_paper_decisions
 from capital.manager import get_or_create_portfolio, save_portfolio_snapshot
 from data.feature_store import get_price_history
 from review.weekly_report import generate_weekly_report
+from execution.paper import sync_portfolio_from_alpaca
 
 load_dotenv()
 logger = get_logger("main")
@@ -155,31 +156,23 @@ def run_paper_execution():
 
 
 def run_eod_sync():
-    """Scheduled job: end-of-day portfolio sync and snapshot."""
+    """Scheduled job: end-of-day portfolio sync from Alpaca."""
     if check_kill_switch():
         return
 
-    logger.info("Running end-of-day portfolio sync")
+    logger.info("Running end-of-day portfolio sync (Alpaca)")
     try:
         session = get_session()
-        portfolio = get_or_create_portfolio(session)
-        positions = portfolio.get("positions", {})
-
-        if positions:
-            symbols = list(positions.keys())
-            prices_df = get_price_history(symbols, lookback_days=2, session=session)
-            if not prices_df.empty:
-                latest = prices_df.iloc[-1]
-                prices = {s: float(latest[s]) for s in latest.index if latest[s] > 0}
-                save_portfolio_snapshot(session, portfolio["cash"], positions, prices)
+        portfolio = sync_portfolio_from_alpaca(session)
+        session.commit()
 
         logger.info(
-            "EOD sync complete",
+            "EOD sync complete (Alpaca)",
             extra={
                 "extra_data": {
                     "cash": portfolio["cash"],
                     "total_equity": portfolio["total_equity"],
-                    "positions": len(positions),
+                    "positions": len(portfolio.get("positions", {})),
                 }
             },
         )

@@ -19,8 +19,8 @@ from data.db import PortfolioState, Deposit, get_session, init_db
 
 logger = get_logger("capital.manager")
 
-# Default initial capital for paper trading
-DEFAULT_INITIAL_CAPITAL = 500.0
+# Default initial capital for paper trading (matches Alpaca paper account)
+DEFAULT_INITIAL_CAPITAL = 100_000.0
 
 
 def get_latest_portfolio_state(session):
