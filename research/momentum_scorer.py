@@ -246,9 +246,28 @@ def compute_signal_strength(features, symbol, benchmark, config):
     # Higher is stronger, lower is weaker
     strength = max(0.1, min(2.0, raw_score / 0.10)) if raw_score > 0 else 0.1
 
+    # Momentum acceleration bonus: if 3m excess > 6m excess, momentum is
+    # accelerating — the trend is getting stronger, not fading.
+    # This is one of the strongest predictors of continued momentum.
+    ret_3m = returns.get("3m", pd.DataFrame())
+    ret_6m = returns.get("6m", pd.DataFrame())
+    accelerating = False
+    if (not ret_3m.empty and not ret_6m.empty
+            and symbol in ret_3m.columns and symbol in ret_6m.columns
+            and benchmark in ret_3m.columns and benchmark in ret_6m.columns):
+        excess_3m = float(ret_3m.iloc[-1][symbol]) - float(ret_3m.iloc[-1][benchmark])
+        excess_6m = float(ret_6m.iloc[-1][symbol]) - float(ret_6m.iloc[-1][benchmark])
+        if excess_3m > excess_6m and excess_3m > 0:
+            accelerating = True
+            strength *= 1.15  # 15% boost for accelerating momentum
+            strength = min(2.0, strength)  # Cap at 2.0
+
     logger.info(
         f"Signal strength for {symbol}: {strength:.2f}",
-        extra={"extra_data": {"scores": scores, "raw": round(raw_score, 4)}},
+        extra={"extra_data": {
+            "scores": scores, "raw": round(raw_score, 4),
+            "accelerating": accelerating,
+        }},
     )
     return strength
 

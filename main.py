@@ -27,6 +27,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from core.logging import get_logger
+from core.market_calendar import is_market_open
 from data.db import init_db, get_session
 from data.ingestion import ingest_daily
 from decision.engine import run_decision_engine
@@ -63,6 +64,10 @@ def run_daily_ingestion():
     if check_kill_switch():
         return
 
+    if not is_market_open():
+        logger.info("Market closed today (holiday) — skipping ingestion")
+        return
+
     logger.info("Running scheduled daily ingestion")
     try:
         count = ingest_daily()
@@ -83,6 +88,10 @@ def run_signal_and_decision():
     global _pending_decisions
 
     if check_kill_switch():
+        return
+
+    if not is_market_open():
+        logger.info("Market closed today (holiday) — skipping signals")
         return
 
     logger.info("Running scheduled signal scoring + decision engine")
@@ -115,6 +124,10 @@ def run_paper_execution():
     global _pending_decisions
 
     if check_kill_switch():
+        return
+
+    if not is_market_open():
+        logger.info("Market closed today (holiday) — skipping execution")
         return
 
     if not _pending_decisions:
@@ -158,6 +171,10 @@ def run_paper_execution():
 def run_eod_sync():
     """Scheduled job: end-of-day portfolio sync from Alpaca."""
     if check_kill_switch():
+        return
+
+    if not is_market_open():
+        logger.info("Market closed today (holiday) — skipping EOD sync")
         return
 
     logger.info("Running end-of-day portfolio sync (Alpaca)")

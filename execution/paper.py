@@ -29,6 +29,7 @@ from capital.manager import (
 )
 from risk.enforcer import load_risk_params, validate_order
 from risk.trailing_stop import update_high_water_marks, check_trailing_stops, clear_high_water
+from capital.rebalancer import check_idle_cash_deployment
 from execution.order_manager import (
     calculate_shares,
     create_order,
@@ -168,6 +169,12 @@ def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
                     "risk_approved": True,
                 })
                 logger.warning(f"Trailing stop SELL injected for {sym}")
+
+        # Check for idle cash that should be deployed into existing winners
+        idle_buys = check_idle_cash_deployment(session, portfolio, decisions, risk_params)
+        if idle_buys:
+            decisions.extend(idle_buys)
+            logger.info(f"Added {len(idle_buys)} idle cash deployment(s)")
 
         # Collect symbols we need prices for (pre-trade sizing)
         symbols = list(set(d["symbol"] for d in decisions if d.get("action") in ("BUY", "SELL")))
