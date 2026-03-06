@@ -70,6 +70,53 @@ def store_decision(session, strategy_name, symbol, action, reason, signal_id=Non
     return decision
 
 
+def get_held_positions(session):
+    """
+    Get list of currently held symbols from the latest portfolio state.
+
+    Returns:
+        List of symbol strings with qty > 0.
+    """
+    from data.db import PortfolioState
+    latest = (
+        session.query(PortfolioState)
+        .order_by(PortfolioState.date.desc())
+        .first()
+    )
+    if latest is None or not latest.positions_json:
+        return []
+
+    positions = json.loads(latest.positions_json)
+    return [sym for sym, qty in positions.items() if qty > 0]
+
+
+def get_exit_log(session):
+    """
+    Build exit log from recent fast-exit trades for cooldown tracking.
+
+    Returns:
+        Dict of {symbol: last_exit_date} for symbols exited via fast exit
+        in the last 10 trading days.
+    """
+    from data.db import Trade
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=14)  # ~10 trading days
+
+    recent_exits = (
+        session.query(Trade)
+        .filter(Trade.exit_date >= cutoff)
+        .order_by(Trade.exit_date.desc())
+        .all()
+    )
+
+    exit_log = {}
+    for trade in recent_exits:
+        sym = trade.symbol
+        if sym not in exit_log:
+            exit_log[sym] = trade.exit_date
+    return exit_log
+
+
 def apply_regime_filter(signals, regime, strategy_name, session):
     """
     Apply regime filters to signals, producing decisions.
@@ -134,7 +181,17 @@ def apply_regime_filter(signals, regime, strategy_name, session):
             )
 
         elif signal_type == "SELL":
-            reason = f"SELL: No absolute momentum (12m return below benchmark)"
+            metadata = sig.get("metadata", {})
+            if metadata.get("fast_exit"):
+                exit_details = metadata.get("exit_details", {})
+                reason = (
+                    f"SELL: Fast exit — 3m return ({exit_details.get('return_3m', 0):.4f}) "
+                    f"below benchmark ({exit_details.get('benchmark_3m', 0):.4f})"
+                )
+            elif metadata.get("scan_type") == "daily":
+                reason = f"SELL: Daily scan exit — 3m momentum breakdown"
+            else:
+                reason = f"SELL: No absolute momentum (12m return below benchmark)"
             decision = store_decision(
                 session, strategy_name, symbol,
                 action="SELL",
@@ -254,9 +311,10 @@ def run_decision_engine(config_path="config/settings.yaml"):
             logger.warning("No price data in database — run data ingestion first")
             return []
 
-        # Step 3: Generate signals
+        # Step 3: Generate signals (with cooldown awareness)
         logger.info("Generating strategy signals")
-        signals = strategy.generate_signals(data=features)
+        exit_log = get_exit_log(session)
+        signals = strategy.generate_signals(data=features, exit_log=exit_log)
 
         if not signals:
             logger.info("No signals generated — nothing to decide")
@@ -307,7 +365,100 @@ def run_decision_engine(config_path="config/settings.yaml"):
         session.close()
 
 
+def run_daily_decision_engine(config_path="config/settings.yaml"):
+    """
+    Daily decision engine — exit losers and reallocate immediately.
+
+    Runs every trading day (not just weekly rebalance).
+    Checks held positions for 3m momentum breakdown, finds replacements.
+
+    Returns:
+        List of decision dicts (SELLs + replacement BUYs).
+    """
+    logger.info("=" * 50)
+    logger.info("Daily decision engine starting")
+    logger.info("=" * 50)
+
+    config = load_config(config_path)
+    init_db()
+    session = get_session()
+
+    try:
+        strategy = DualMomentumStrategy()
+        instruments = strategy.get_instruments()
+        feature_symbols = list(set(instruments + ["SPY"]))
+
+        # Build features
+        features = build_features(feature_symbols, lookback_days=352)
+        if features["prices"].empty:
+            logger.warning("No price data — run data ingestion first")
+            return []
+
+        # Get current holdings and exit log
+        held_positions = get_held_positions(session)
+        exit_log = get_exit_log(session)
+
+        if not held_positions:
+            logger.info("No positions held — daily scan has nothing to check")
+            return []
+
+        logger.info(
+            f"Daily scan: checking {len(held_positions)} positions",
+            extra={"extra_data": {"held": held_positions, "exit_log_symbols": list(exit_log.keys())}},
+        )
+
+        # Generate daily signals (exit + replace)
+        signals = strategy.generate_daily_signals(
+            data=features,
+            held_positions=held_positions,
+            exit_log=exit_log,
+        )
+
+        if not signals:
+            logger.info("Daily scan: all positions healthy, no action needed")
+            return []
+
+        # Classify regime (for replacement BUYs)
+        risk_params = load_risk_params()
+        regime = classify_regime(features, risk_params)
+
+        # Apply regime filter → produce decisions
+        decisions = apply_regime_filter(signals, regime, strategy.name, session)
+
+        session.commit()
+
+        logger.info(
+            "Daily decision engine complete",
+            extra={
+                "extra_data": {
+                    "signals_count": len(signals),
+                    "decisions_count": len(decisions),
+                    "sells": [d["symbol"] for d in decisions if d["action"] == "SELL"],
+                    "buys": [d["symbol"] for d in decisions if d["action"] == "BUY"],
+                }
+            },
+        )
+        return decisions
+
+    except Exception as e:
+        session.rollback()
+        logger.error(
+            "Daily decision engine failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+        raise
+    finally:
+        session.close()
+
+
 if __name__ == "__main__":
-    decisions = run_decision_engine()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "daily":
+        decisions = run_daily_decision_engine()
+        print("=== Daily Scan Results ===")
+    else:
+        decisions = run_decision_engine()
+        print("=== Weekly Rebalance Results ===")
     for d in decisions:
         print(f"  {d['action']:5s} {d['symbol']:5s} — {d['reason']}")

@@ -14,7 +14,7 @@ import yaml
 from core.logging import get_logger
 from strategies.base import StrategyBase
 from data.feature_store import build_features
-from research.momentum_scorer import score_dual_momentum
+from research.momentum_scorer import score_dual_momentum, run_daily_scan
 from research.regime import classify_regime
 
 logger = get_logger("strategies.momentum_v1")
@@ -43,12 +43,13 @@ class DualMomentumStrategy(StrategyBase):
         safe = instruments.get("safe_assets", [])
         return risk + safe
 
-    def generate_signals(self, data=None):
+    def generate_signals(self, data=None, exit_log=None):
         """
-        Generate dual momentum signals.
+        Generate dual momentum signals (weekly rebalance).
 
         Args:
             data: Pre-built features dict, or None to build from DB.
+            exit_log: Optional dict of {symbol: last_exit_date} for cooldown.
 
         Returns:
             List of signal dicts from momentum scorer.
@@ -64,7 +65,7 @@ class DualMomentumStrategy(StrategyBase):
             logger.warning("No price data available for signal generation")
             return []
 
-        signals = score_dual_momentum(data, self.config)
+        signals = score_dual_momentum(data, self.config, exit_log=exit_log)
 
         logger.info(
             "Signal generation complete",
@@ -72,6 +73,53 @@ class DualMomentumStrategy(StrategyBase):
                 "extra_data": {
                     "strategy": self.name,
                     "signal_count": len(signals),
+                }
+            },
+        )
+        return signals
+
+    def generate_daily_signals(self, data=None, held_positions=None, exit_log=None):
+        """
+        Generate daily exit+reallocate signals.
+
+        Runs every trading day. Checks held positions for 3m breakdown,
+        immediately finds replacements for freed slots.
+
+        Args:
+            data: Pre-built features dict, or None to build from DB.
+            held_positions: List of currently held symbols.
+            exit_log: Dict of {symbol: last_exit_date} for cooldown.
+
+        Returns:
+            List of signal dicts (SELL exits + BUY replacements).
+        """
+        logger.info(f"Generating daily signals for {self.name} v{self.version}")
+
+        if held_positions is None:
+            held_positions = []
+
+        if not held_positions:
+            logger.info("No held positions — daily scan skipped")
+            return []
+
+        if data is None:
+            symbols = self.get_instruments()
+            data = build_features(symbols, lookback_days=self.lookback_days + 100)
+
+        if data.get("prices") is None or data["prices"].empty:
+            logger.warning("No price data available for daily scan")
+            return []
+
+        signals = run_daily_scan(data, held_positions, self.config, exit_log=exit_log)
+
+        logger.info(
+            "Daily signal generation complete",
+            extra={
+                "extra_data": {
+                    "strategy": self.name,
+                    "signal_count": len(signals),
+                    "exits": [s["symbol"] for s in signals if s["signal_type"] == "SELL"],
+                    "replacements": [s["symbol"] for s in signals if s["signal_type"] == "BUY"],
                 }
             },
         )
