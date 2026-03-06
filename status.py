@@ -104,6 +104,14 @@ def check_go_live_readiness(session, trade_stats, equity_history, risk_events):
     """
     Check if paper trading meets go-live criteria.
 
+    All 6 criteria must pass:
+    1. Minimum days active
+    2. Minimum realized trades
+    3. Max drawdown under limit
+    4. Win rate above threshold
+    5. Profit factor >= 1.0
+    6. Daily loss events under limit
+
     Returns:
         Dict with each criterion and pass/fail status.
     """
@@ -112,6 +120,13 @@ def check_go_live_readiness(session, trade_stats, equity_history, risk_events):
         risk_params = yaml.safe_load(f)
 
     criteria = risk_params.get("go_live_criteria", {})
+
+    # Get realized trade performance (win rate, profit factor)
+    from capital.manager import get_trade_performance
+    perf = get_trade_performance(session) if session else {
+        "total_trades": 0, "wins": 0, "losses": 0,
+        "win_rate": 0, "profit_factor": 0, "total_pnl": 0,
+    }
 
     checks = {}
 
@@ -125,14 +140,14 @@ def check_go_live_readiness(session, trade_stats, equity_history, risk_events):
         "label": f"Trading for {days_active}/{min_days} days",
     }
 
-    # 2. Minimum trades
+    # 2. Minimum realized trades
     min_trades = criteria.get("min_trades", 6)
-    total_trades = trade_stats.get("total_trades", 0)
+    realized_trades = perf["total_trades"]
     checks["min_trades"] = {
         "required": min_trades,
-        "actual": total_trades,
-        "passed": total_trades >= min_trades,
-        "label": f"{total_trades}/{min_trades} trades completed",
+        "actual": realized_trades,
+        "passed": realized_trades >= min_trades,
+        "label": f"{realized_trades}/{min_trades} realized trades",
     }
 
     # 3. Max drawdown
@@ -145,7 +160,30 @@ def check_go_live_readiness(session, trade_stats, equity_history, risk_events):
         "label": f"Max drawdown {actual_dd:.2%} (limit {max_dd:.0%})",
     }
 
-    # 4. Daily loss events
+    # 4. Win rate
+    min_win_rate = criteria.get("min_win_rate", 0.35)
+    actual_win_rate = perf["win_rate"]
+    win_rate_passed = actual_win_rate >= min_win_rate if realized_trades > 0 else False
+    checks["win_rate"] = {
+        "required": f"{min_win_rate:.0%}",
+        "actual": f"{actual_win_rate:.0%}",
+        "passed": win_rate_passed,
+        "label": f"Win rate {actual_win_rate:.0%} (need {min_win_rate:.0%}) — {perf['wins']}W/{perf['losses']}L",
+    }
+
+    # 5. Profit factor
+    min_pf = criteria.get("min_profit_factor", 1.0)
+    actual_pf = perf["profit_factor"]
+    pf_display = f"{actual_pf:.2f}" if actual_pf != float("inf") else "inf"
+    pf_passed = actual_pf >= min_pf if realized_trades > 0 else False
+    checks["profit_factor"] = {
+        "required": f"{min_pf:.1f}",
+        "actual": pf_display,
+        "passed": pf_passed,
+        "label": f"Profit factor {pf_display} (need {min_pf:.1f}) — P&L ${perf['total_pnl']:+.2f}",
+    }
+
+    # 6. Daily loss events
     max_events = criteria.get("max_daily_loss_events", 3)
     loss_events = len([e for e in risk_events if e["type"] == "daily_loss_limit"])
     checks["daily_loss_events"] = {
@@ -230,6 +268,17 @@ def print_status():
     print(f"  Sells:        {trade_stats['sells']}")
     print(f"  First trade:  {trade_stats['first_trade'] or 'None yet'}")
     print(f"  Days active:  {trade_stats['days_active']}")
+
+    # Realized P&L (the scorecard)
+    from capital.manager import get_trade_performance
+    perf = get_trade_performance(session)
+    if perf["total_trades"] > 0:
+        print(f"\n--- Realized P&L (Closed Trades) ---")
+        print(f"  Trades:       {perf['total_trades']}  ({perf['wins']}W / {perf['losses']}L)")
+        print(f"  Win rate:     {perf['win_rate']:.0%}")
+        pf = f"{perf['profit_factor']:.2f}" if perf['profit_factor'] != float('inf') else "inf"
+        print(f"  Profit factor:{pf:>8s}")
+        print(f"  Total P&L:    ${perf['total_pnl']:>+12,.2f}")
 
     equity_history = get_equity_history(session)
     print(f"\n--- Equity Curve ---")

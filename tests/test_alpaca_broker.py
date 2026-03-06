@@ -250,6 +250,34 @@ class TestRetryLogic:
 
 
 class TestGoLiveReadiness:
+    """Go-live readiness checks.
+
+    These tests use a real DB session so the Trade-based checks
+    (win rate, profit factor) can query the database.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_db(self):
+        from data.db import init_db, get_session, Base, Trade
+        os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+        engine = init_db("sqlite:///:memory:")
+        self.session = get_session(engine)
+        yield
+        Base.metadata.drop_all(engine)
+
+    def _add_winning_trades(self, count):
+        """Add winning trades to the database."""
+        from data.db import Trade
+        from datetime import datetime
+        for i in range(count):
+            trade = Trade(
+                symbol="SPY", qty=1, entry_price=100, exit_price=110,
+                realized_pnl=10, realized_pnl_pct=10.0, is_win=True,
+                exit_date=datetime.utcnow(),
+            )
+            self.session.add(trade)
+        self.session.commit()
+
     def test_not_ready_at_start(self):
         from status import check_go_live_readiness
 
@@ -257,20 +285,25 @@ class TestGoLiveReadiness:
         equity_history = {"drawdown_pct": 0, "snapshots": 0}
         risk_events = []
 
-        result = check_go_live_readiness(None, trade_stats, equity_history, risk_events)
+        result = check_go_live_readiness(self.session, trade_stats, equity_history, risk_events)
         assert result["ready"] is False
         assert result["checks"]["min_days"]["passed"] is False
         assert result["checks"]["min_trades"]["passed"] is False
 
-    def test_ready_after_30_days(self):
+    def test_ready_when_all_criteria_met(self):
         from status import check_go_live_readiness
+
+        # Add enough winning trades to pass win_rate and profit_factor
+        self._add_winning_trades(8)
 
         trade_stats = {"total_trades": 15, "days_active": 35}
         equity_history = {"drawdown_pct": 3.5, "snapshots": 30}
         risk_events = []
 
-        result = check_go_live_readiness(None, trade_stats, equity_history, risk_events)
+        result = check_go_live_readiness(self.session, trade_stats, equity_history, risk_events)
         assert result["ready"] is True
+        assert result["checks"]["win_rate"]["passed"] is True
+        assert result["checks"]["profit_factor"]["passed"] is True
 
     def test_fails_on_high_drawdown(self):
         from status import check_go_live_readiness
@@ -279,12 +312,14 @@ class TestGoLiveReadiness:
         equity_history = {"drawdown_pct": 16.0, "snapshots": 30}  # Over 15% limit
         risk_events = []
 
-        result = check_go_live_readiness(None, trade_stats, equity_history, risk_events)
+        result = check_go_live_readiness(self.session, trade_stats, equity_history, risk_events)
         assert result["ready"] is False
         assert result["checks"]["max_drawdown"]["passed"] is False
 
     def test_fails_on_too_many_loss_events(self):
         from status import check_go_live_readiness
+
+        self._add_winning_trades(8)
 
         trade_stats = {"total_trades": 15, "days_active": 35}
         equity_history = {"drawdown_pct": 3.0, "snapshots": 30}
@@ -295,6 +330,18 @@ class TestGoLiveReadiness:
             {"type": "daily_loss_limit", "severity": "CRITICAL", "date": "2026-03-12"},
         ]
 
-        result = check_go_live_readiness(None, trade_stats, equity_history, risk_events)
+        result = check_go_live_readiness(self.session, trade_stats, equity_history, risk_events)
         assert result["ready"] is False
         assert result["checks"]["daily_loss_events"]["passed"] is False
+
+    def test_fails_on_zero_trades(self):
+        from status import check_go_live_readiness
+
+        trade_stats = {"total_trades": 0, "days_active": 35}
+        equity_history = {"drawdown_pct": 3.0, "snapshots": 30}
+        risk_events = []
+
+        result = check_go_live_readiness(self.session, trade_stats, equity_history, risk_events)
+        assert result["ready"] is False
+        assert result["checks"]["win_rate"]["passed"] is False
+        assert result["checks"]["profit_factor"]["passed"] is False
