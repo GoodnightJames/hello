@@ -13,7 +13,7 @@ from research.momentum_scorer import (
     check_rsi_filter,
     check_fast_exit,
     is_in_cooldown,
-    run_daily_exit_scan,
+    run_daily_scan,
     compute_volatility_scalar,
     compute_signal_strength,
     score_dual_momentum,
@@ -643,12 +643,16 @@ class TestMultiPositionBuy:
         assert spy_signals[0]["metadata"].get("fast_exit") is True
 
 
-class TestDailyExitScan:
+class TestDailyScan:
     def test_exits_broken_positions(self, strategy_config):
         """Daily scan should SELL positions with 3m breakdown."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
             "returns": {
+                "12m": pd.DataFrame(
+                    {"SPY": [0.20] * 5, "QQQ": [0.18] * 5, "SHY": [0.04] * 5},
+                    index=dates,
+                ),
                 "3m": pd.DataFrame(
                     {
                         "SPY": [0.05, 0.03, 0.01, -0.01, -0.02],  # broken
@@ -659,11 +663,11 @@ class TestDailyExitScan:
                 ),
             },
         }
-        signals = run_daily_exit_scan(features, ["SPY", "QQQ"], strategy_config)
-        assert len(signals) == 1
-        assert signals[0]["symbol"] == "SPY"
-        assert signals[0]["signal_type"] == "SELL"
-        assert signals[0]["metadata"]["scan_type"] == "daily_exit"
+        signals = run_daily_scan(features, ["SPY", "QQQ"], strategy_config)
+        sell_signals = [s for s in signals if s["signal_type"] == "SELL"]
+        assert len(sell_signals) == 1
+        assert sell_signals[0]["symbol"] == "SPY"
+        assert sell_signals[0]["metadata"]["scan_type"] == "daily"
 
     def test_no_exits_when_all_healthy(self, strategy_config):
         """No exits when all positions are above benchmark."""
@@ -680,33 +684,142 @@ class TestDailyExitScan:
                 ),
             },
         }
-        signals = run_daily_exit_scan(features, ["SPY", "QQQ"], strategy_config)
+        signals = run_daily_scan(features, ["SPY", "QQQ"], strategy_config)
         assert len(signals) == 0
 
     def test_empty_positions_no_signals(self, strategy_config):
         """No held positions = no signals."""
-        signals = run_daily_exit_scan({}, [], strategy_config)
+        signals = run_daily_scan({}, [], strategy_config)
         assert signals == []
 
-    def test_daily_scan_never_buys(self, strategy_config):
-        """Daily scan only produces SELL signals, never BUY."""
+    def test_exit_triggers_replacement_buy(self, strategy_config):
+        """When a position exits, a replacement should be found immediately."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
+            "prices": pd.DataFrame(),
             "returns": {
+                "12m": pd.DataFrame(
+                    {
+                        "SPY": [0.20] * 5,   # held, broken
+                        "QQQ": [0.18] * 5,    # held, fine
+                        "XLK": [0.15] * 5,    # not held, available replacement
+                        "AGG": [0.03] * 5,
+                        "SHY": [0.04] * 5,
+                        "TLT": [0.02] * 5,
+                    },
+                    index=dates,
+                ),
+                "6m": pd.DataFrame(
+                    {
+                        "SPY": [0.12] * 5,
+                        "XLK": [0.09] * 5,
+                        "SHY": [0.02] * 5,
+                    },
+                    index=dates,
+                ),
                 "3m": pd.DataFrame(
                     {
-                        "SPY": [-0.05] * 5,
-                        "QQQ": [-0.03] * 5,
-                        "XLK": [-0.04] * 5,
+                        "SPY": [0.05, 0.03, 0.01, -0.01, -0.02],  # broken
+                        "QQQ": [0.06] * 5,    # fine
+                        "XLK": [0.05] * 5,    # strong replacement
                         "SHY": [0.01] * 5,
                     },
                     index=dates,
                 ),
             },
+            "sma": {},
+            "rsi_2": pd.DataFrame(),
         }
-        signals = run_daily_exit_scan(features, ["SPY", "QQQ", "XLK"], strategy_config)
-        for s in signals:
-            assert s["signal_type"] == "SELL"
+        signals = run_daily_scan(features, ["SPY", "QQQ"], strategy_config)
+        sell_signals = [s for s in signals if s["signal_type"] == "SELL"]
+        buy_signals = [s for s in signals if s["signal_type"] == "BUY"]
+        assert len(sell_signals) == 1
+        assert sell_signals[0]["symbol"] == "SPY"
+        assert len(buy_signals) == 1
+        assert buy_signals[0]["symbol"] == "XLK"
+        assert buy_signals[0]["metadata"]["replacement_for"] == "SPY"
+
+    def test_no_replacement_rotates_to_bonds(self, strategy_config):
+        """When no risk asset qualifies as replacement, rotate to bonds."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        features = {
+            "prices": pd.DataFrame(),
+            "returns": {
+                "12m": pd.DataFrame(
+                    {
+                        "SPY": [0.20] * 5,    # held, broken
+                        "QQQ": [0.01] * 5,     # no abs momentum
+                        "AGG": [0.03] * 5,
+                        "SHY": [0.04] * 5,
+                        "TLT": [0.02] * 5,
+                    },
+                    index=dates,
+                ),
+                "6m": pd.DataFrame(),
+                "3m": pd.DataFrame(
+                    {
+                        "SPY": [-0.02] * 5,   # broken
+                        "SHY": [0.01] * 5,
+                    },
+                    index=dates,
+                ),
+            },
+            "sma": {},
+            "rsi_2": pd.DataFrame(),
+        }
+        signals = run_daily_scan(features, ["SPY"], strategy_config)
+        sell_signals = [s for s in signals if s["signal_type"] == "SELL"]
+        buy_signals = [s for s in signals if s["signal_type"] == "BUY"]
+        assert len(sell_signals) == 1
+        assert len(buy_signals) == 1
+        assert buy_signals[0]["symbol"] == "AGG"
+        assert "bonds" in buy_signals[0]["metadata"]["reason"].lower()
+
+    def test_cooldown_prevents_replacement_reentry(self, strategy_config):
+        """Recently exited symbols can't be picked as replacements."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        yesterday = pd.Timestamp.now().normalize() - pd.offsets.BDay(1)
+        features = {
+            "prices": pd.DataFrame(),
+            "returns": {
+                "12m": pd.DataFrame(
+                    {
+                        "SPY": [0.20] * 5,    # held, broken
+                        "IWM": [0.18] * 5,     # in cooldown
+                        "XLK": [0.15] * 5,     # available
+                        "AGG": [0.03] * 5,
+                        "SHY": [0.04] * 5,
+                        "TLT": [0.02] * 5,
+                    },
+                    index=dates,
+                ),
+                "6m": pd.DataFrame(
+                    {
+                        "IWM": [0.10] * 5,
+                        "XLK": [0.09] * 5,
+                        "SHY": [0.02] * 5,
+                    },
+                    index=dates,
+                ),
+                "3m": pd.DataFrame(
+                    {
+                        "SPY": [-0.02] * 5,   # broken
+                        "IWM": [0.06] * 5,     # looks good but in cooldown
+                        "XLK": [0.05] * 5,     # available
+                        "SHY": [0.01] * 5,
+                    },
+                    index=dates,
+                ),
+            },
+            "sma": {},
+            "rsi_2": pd.DataFrame(),
+        }
+        # IWM was exited yesterday — should be in cooldown, skip to XLK
+        exit_log = {"IWM": yesterday}
+        signals = run_daily_scan(features, ["SPY"], strategy_config, exit_log=exit_log)
+        buy_signals = [s for s in signals if s["signal_type"] == "BUY"]
+        assert len(buy_signals) == 1
+        assert buy_signals[0]["symbol"] != "IWM"  # cooldown blocks it
 
 
 class TestCooldown:

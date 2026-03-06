@@ -282,26 +282,34 @@ def is_in_cooldown(symbol, exit_log, config):
     return False, 0
 
 
-def run_daily_exit_scan(features, held_positions, strategy_config):
+def run_daily_scan(features, held_positions, strategy_config, exit_log=None):
     """
-    Daily fast-exit scan — runs every trading day, not just on rebalance.
+    Daily scan — exit losers immediately and reallocate freed slots.
 
-    Checks each held position for 3-month momentum breakdown.
-    This is the "don't wait until Friday" check.
+    1. Check each held position for 3-month momentum breakdown → SELL.
+    2. For each freed slot, find the next best qualified asset → BUY.
+    Capital never sits idle.
 
     Args:
         features: Dict from feature_store.build_features().
         held_positions: List of symbols currently held.
         strategy_config: Dict loaded from momentum_v1.yaml.
+        exit_log: Optional dict of {symbol: last_exit_date} for cooldown tracking.
 
     Returns:
-        List of signal dicts (SELL signals only — daily scan never buys).
+        List of signal dicts (SELL exits + BUY replacements).
     """
-    logger.info(f"Running daily exit scan for {len(held_positions)} positions")
+    if exit_log is None:
+        exit_log = {}
+
+    logger.info(f"Running daily scan for {len(held_positions)} positions")
 
     benchmark = strategy_config.get("signals", {}).get("benchmark", "SHY")
+    max_positions = strategy_config.get("signals", {}).get("max_buy_signals", 3)
     signals = []
+    exited_symbols = []
 
+    # --- Phase 1: Exit broken positions ---
     for symbol in held_positions:
         should_exit, details = check_fast_exit(
             features, symbol, benchmark, strategy_config
@@ -313,17 +321,128 @@ def run_daily_exit_scan(features, held_positions, strategy_config):
                 "score": 0.0,
                 "signal_strength": 0.0,
                 "metadata": {
-                    "scan_type": "daily_exit",
+                    "scan_type": "daily",
                     "fast_exit": True,
                     "exit_details": details,
                 },
             })
+            exited_symbols.append(symbol)
+
+    if not exited_symbols:
+        logger.info("Daily scan: no exits, all positions healthy")
+        return signals
+
+    # --- Phase 2: Find replacements for freed slots ---
+    open_slots = len(exited_symbols)
+    remaining_held = [s for s in held_positions if s not in exited_symbols]
+
+    # Can't re-buy what we just exited or already hold
+    excluded = set(exited_symbols + remaining_held)
+    # Also exclude anything in cooldown
+    for sym in list(exit_log.keys()):
+        in_cd, _ = is_in_cooldown(sym, exit_log, strategy_config)
+        if in_cd:
+            excluded.add(sym)
+
+    returns = features.get("returns", {})
+    returns_12m = returns.get("12m", pd.DataFrame())
+
+    if returns_12m.empty:
+        logger.info("Daily scan: no return data for replacements")
+        return signals
+
+    instruments = strategy_config.get("instruments", {})
+    risk_assets = instruments.get("risk_assets", [])
+    safe_assets = instruments.get("safe_assets", [])
+
+    # Rank available risk assets
+    risk_candidates = [
+        s for s in risk_assets
+        if s in returns_12m.columns and s not in excluded
+    ]
+
+    abs_momentum = compute_absolute_momentum(returns_12m, benchmark)
+    relative_ranking = compute_relative_momentum(returns_12m, risk_candidates)
+
+    latest_returns = returns_12m.iloc[-1]
+    benchmark_return = float(latest_returns.get(benchmark, 0))
+
+    replacements_found = 0
+    for rank, (symbol, ret) in enumerate(relative_ranking):
+        if replacements_found >= open_slots:
+            break
+
+        if not abs_momentum.get(symbol, False):
+            continue
+
+        # Run the same filter pipeline as weekly rebalance
+        mt_confirmed, mt_details = check_multi_timeframe(
+            features, symbol, benchmark, strategy_config
+        )
+        has_edge, excess_return = check_minimum_edge(ret, benchmark_return, strategy_config)
+        rsi_allowed, rsi_value, rsi_multiplier = check_rsi_filter(
+            features, symbol, strategy_config
+        )
+
+        if mt_confirmed and has_edge and rsi_allowed:
+            strength = compute_signal_strength(
+                features, symbol, benchmark, strategy_config
+            )
+            strength *= rsi_multiplier
+
+            replacements_found += 1
+            signals.append({
+                "symbol": symbol,
+                "signal_type": "BUY",
+                "score": ret,
+                "signal_strength": strength,
+                "metadata": {
+                    "scan_type": "daily",
+                    "replacement_for": exited_symbols[replacements_found - 1],
+                    "absolute_momentum": True,
+                    "relative_rank": rank + 1,
+                    "benchmark_return": benchmark_return,
+                    "asset_return": ret,
+                    "excess_return": excess_return,
+                    "multi_timeframe": mt_details,
+                    "rsi_2": rsi_value,
+                    "signal_strength": round(strength, 3),
+                },
+            })
+
+    # If no risk asset qualifies as replacement → rotate to safe asset
+    unfilled_slots = open_slots - replacements_found
+    if unfilled_slots > 0:
+        safe_available = [
+            s for s in safe_assets
+            if s in returns_12m.columns and s != benchmark and s not in excluded
+        ]
+        if safe_available:
+            safe_ranked = sorted(
+                safe_available,
+                key=lambda s: float(latest_returns.get(s, 0)),
+                reverse=True,
+            )
+            best_safe = safe_ranked[0]
+            safe_return = float(latest_returns.get(best_safe, 0))
+            signals.append({
+                "symbol": best_safe,
+                "signal_type": "BUY",
+                "score": safe_return,
+                "signal_strength": 0.5,
+                "metadata": {
+                    "scan_type": "daily",
+                    "replacement_for": "unfilled_slots",
+                    "reason": f"No risk asset qualified — rotating {unfilled_slots} slot(s) to bonds",
+                },
+            })
 
     logger.info(
-        f"Daily exit scan complete: {len(signals)} exits triggered",
+        f"Daily scan complete: {len(exited_symbols)} exits, {replacements_found} replacements, {unfilled_slots} to bonds",
         extra={"extra_data": {
             "held": held_positions,
-            "exits": [s["symbol"] for s in signals],
+            "exits": exited_symbols,
+            "replacements": [s["symbol"] for s in signals if s["signal_type"] == "BUY"],
         }},
     )
     return signals
