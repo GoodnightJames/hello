@@ -12,6 +12,8 @@ from research.momentum_scorer import (
     check_minimum_edge,
     check_rsi_filter,
     check_fast_exit,
+    is_in_cooldown,
+    run_daily_exit_scan,
     compute_volatility_scalar,
     compute_signal_strength,
     score_dual_momentum,
@@ -639,3 +641,140 @@ class TestMultiPositionBuy:
         assert len(spy_signals) == 1
         assert spy_signals[0]["signal_type"] == "SELL"
         assert spy_signals[0]["metadata"].get("fast_exit") is True
+
+
+class TestDailyExitScan:
+    def test_exits_broken_positions(self, strategy_config):
+        """Daily scan should SELL positions with 3m breakdown."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        features = {
+            "returns": {
+                "3m": pd.DataFrame(
+                    {
+                        "SPY": [0.05, 0.03, 0.01, -0.01, -0.02],  # broken
+                        "QQQ": [0.04, 0.05, 0.06, 0.07, 0.08],    # fine
+                        "SHY": [0.01] * 5,
+                    },
+                    index=dates,
+                ),
+            },
+        }
+        signals = run_daily_exit_scan(features, ["SPY", "QQQ"], strategy_config)
+        assert len(signals) == 1
+        assert signals[0]["symbol"] == "SPY"
+        assert signals[0]["signal_type"] == "SELL"
+        assert signals[0]["metadata"]["scan_type"] == "daily_exit"
+
+    def test_no_exits_when_all_healthy(self, strategy_config):
+        """No exits when all positions are above benchmark."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        features = {
+            "returns": {
+                "3m": pd.DataFrame(
+                    {
+                        "SPY": [0.08] * 5,
+                        "QQQ": [0.06] * 5,
+                        "SHY": [0.01] * 5,
+                    },
+                    index=dates,
+                ),
+            },
+        }
+        signals = run_daily_exit_scan(features, ["SPY", "QQQ"], strategy_config)
+        assert len(signals) == 0
+
+    def test_empty_positions_no_signals(self, strategy_config):
+        """No held positions = no signals."""
+        signals = run_daily_exit_scan({}, [], strategy_config)
+        assert signals == []
+
+    def test_daily_scan_never_buys(self, strategy_config):
+        """Daily scan only produces SELL signals, never BUY."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        features = {
+            "returns": {
+                "3m": pd.DataFrame(
+                    {
+                        "SPY": [-0.05] * 5,
+                        "QQQ": [-0.03] * 5,
+                        "XLK": [-0.04] * 5,
+                        "SHY": [0.01] * 5,
+                    },
+                    index=dates,
+                ),
+            },
+        }
+        signals = run_daily_exit_scan(features, ["SPY", "QQQ", "XLK"], strategy_config)
+        for s in signals:
+            assert s["signal_type"] == "SELL"
+
+
+class TestCooldown:
+    def test_recent_exit_blocks_buy(self, strategy_config):
+        """Symbol exited 2 days ago should be in cooldown (5-day default)."""
+        two_days_ago = (pd.Timestamp.now().normalize() - pd.offsets.BDay(2))
+        exit_log = {"SPY": two_days_ago}
+        in_cd, remaining = is_in_cooldown("SPY", exit_log, strategy_config)
+        assert in_cd is True
+        assert remaining > 0
+
+    def test_old_exit_allows_buy(self, strategy_config):
+        """Symbol exited 10 days ago should be clear."""
+        ten_days_ago = (pd.Timestamp.now().normalize() - pd.offsets.BDay(10))
+        exit_log = {"SPY": ten_days_ago}
+        in_cd, remaining = is_in_cooldown("SPY", exit_log, strategy_config)
+        assert in_cd is False
+        assert remaining == 0
+
+    def test_no_exit_log_no_cooldown(self, strategy_config):
+        """Symbol not in exit log = no cooldown."""
+        in_cd, remaining = is_in_cooldown("QQQ", {}, strategy_config)
+        assert in_cd is False
+
+    def test_cooldown_in_scoring_pipeline(self, strategy_config):
+        """Cooldown should produce HOLD with cooldown metadata in full pipeline."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="B")
+        returns_12m = pd.DataFrame(
+            {
+                "SPY": [0.25] * 5,
+                "QQQ": [0.20] * 5,
+                "AGG": [0.03] * 5,
+                "SHY": [0.04] * 5,
+                "TLT": [0.02] * 5,
+            },
+            index=dates,
+        )
+        returns_6m = pd.DataFrame(
+            {
+                "SPY": [0.15] * 5,
+                "QQQ": [0.12] * 5,
+                "SHY": [0.02] * 5,
+            },
+            index=dates,
+        )
+        returns_3m = pd.DataFrame(
+            {
+                "SPY": [0.08] * 5,
+                "QQQ": [0.06] * 5,
+                "SHY": [0.01] * 5,
+            },
+            index=dates,
+        )
+        features = {
+            "prices": pd.DataFrame(),
+            "returns": {"12m": returns_12m, "6m": returns_6m, "3m": returns_3m},
+            "sma": {},
+            "rsi_2": pd.DataFrame(),
+        }
+        # SPY exited yesterday — should be in cooldown
+        yesterday = pd.Timestamp.now().normalize() - pd.offsets.BDay(1)
+        exit_log = {"SPY": yesterday}
+        signals = score_dual_momentum(features, strategy_config, exit_log=exit_log)
+        spy_signals = [s for s in signals if s["symbol"] == "SPY"]
+        assert len(spy_signals) == 1
+        assert spy_signals[0]["signal_type"] == "HOLD"
+        assert spy_signals[0]["metadata"].get("cooldown") is True
+        # QQQ should still get BUY (not in cooldown)
+        qqq_signals = [s for s in signals if s["symbol"] == "QQQ"]
+        assert len(qqq_signals) == 1
+        assert qqq_signals[0]["signal_type"] == "BUY"

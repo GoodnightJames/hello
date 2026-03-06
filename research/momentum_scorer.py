@@ -245,6 +245,90 @@ def check_fast_exit(features, symbol, benchmark, config):
     return False, details
 
 
+def is_in_cooldown(symbol, exit_log, config):
+    """
+    Check if a symbol is in cooldown after a fast exit.
+
+    Prevents whipsaw: exit Monday, re-buy Friday, exit again Monday.
+    After a fast exit, wait N trading days before allowing re-entry.
+
+    Args:
+        symbol: The asset to check.
+        exit_log: Dict of {symbol: last_exit_date} (pd.Timestamp or str).
+        config: Strategy config dict.
+
+    Returns:
+        (in_cooldown: bool, days_remaining: int)
+    """
+    fast_exit_config = config.get("signals", {}).get("fast_exit", {})
+    cooldown_days = fast_exit_config.get("cooldown_days", 5)
+
+    if cooldown_days <= 0 or symbol not in exit_log:
+        return False, 0
+
+    last_exit = pd.Timestamp(exit_log[symbol])
+    today = pd.Timestamp.now().normalize()
+    # Count business days since exit
+    bdays = pd.bdate_range(start=last_exit, end=today)
+    elapsed = max(0, len(bdays) - 1)  # exclude the exit day itself
+
+    if elapsed < cooldown_days:
+        remaining = cooldown_days - elapsed
+        logger.info(
+            f"Cooldown active for {symbol}: {elapsed}/{cooldown_days} days elapsed, {remaining} remaining",
+        )
+        return True, remaining
+
+    return False, 0
+
+
+def run_daily_exit_scan(features, held_positions, strategy_config):
+    """
+    Daily fast-exit scan — runs every trading day, not just on rebalance.
+
+    Checks each held position for 3-month momentum breakdown.
+    This is the "don't wait until Friday" check.
+
+    Args:
+        features: Dict from feature_store.build_features().
+        held_positions: List of symbols currently held.
+        strategy_config: Dict loaded from momentum_v1.yaml.
+
+    Returns:
+        List of signal dicts (SELL signals only — daily scan never buys).
+    """
+    logger.info(f"Running daily exit scan for {len(held_positions)} positions")
+
+    benchmark = strategy_config.get("signals", {}).get("benchmark", "SHY")
+    signals = []
+
+    for symbol in held_positions:
+        should_exit, details = check_fast_exit(
+            features, symbol, benchmark, strategy_config
+        )
+        if should_exit:
+            signals.append({
+                "symbol": symbol,
+                "signal_type": "SELL",
+                "score": 0.0,
+                "signal_strength": 0.0,
+                "metadata": {
+                    "scan_type": "daily_exit",
+                    "fast_exit": True,
+                    "exit_details": details,
+                },
+            })
+
+    logger.info(
+        f"Daily exit scan complete: {len(signals)} exits triggered",
+        extra={"extra_data": {
+            "held": held_positions,
+            "exits": [s["symbol"] for s in signals],
+        }},
+    )
+    return signals
+
+
 def compute_volatility_scalar(features, symbol):
     """
     Compute inverse-volatility position size scalar.
@@ -343,20 +427,24 @@ def compute_signal_strength(features, symbol, benchmark, config):
     return strength
 
 
-def score_dual_momentum(features, strategy_config):
+def score_dual_momentum(features, strategy_config, exit_log=None):
     """
     Run the full dual momentum scoring pipeline with alpha optimizations.
 
     v4.0: Multi-position BUY (up to N qualified assets), fast exits,
-    volatility-scaled sizing.
+    volatility-scaled sizing, cooldown enforcement.
 
     Args:
         features: Dict from feature_store.build_features().
         strategy_config: Dict loaded from momentum_v1.yaml.
+        exit_log: Optional dict of {symbol: last_exit_date} for cooldown tracking.
 
     Returns:
         List of signal dicts with signal_strength for position sizing.
     """
+    if exit_log is None:
+        exit_log = {}
+
     logger.info("Running dual momentum scoring (v4.0 multi-position)")
 
     returns = features.get("returns", {})
@@ -410,6 +498,25 @@ def score_dual_momentum(features, strategy_config):
                         "asset_return": ret,
                         "fast_exit": True,
                         "exit_details": exit_details,
+                    },
+                })
+                continue
+
+            # Cooldown check — recently exited symbols can't re-enter yet
+            in_cd, cd_remaining = is_in_cooldown(symbol, exit_log, strategy_config)
+            if in_cd:
+                signals.append({
+                    "symbol": symbol,
+                    "signal_type": "HOLD",
+                    "score": ret,
+                    "signal_strength": 0.0,
+                    "metadata": {
+                        "absolute_momentum": True,
+                        "relative_rank": rank + 1,
+                        "benchmark_return": benchmark_return,
+                        "asset_return": ret,
+                        "cooldown": True,
+                        "cooldown_days_remaining": cd_remaining,
                     },
                 })
                 continue

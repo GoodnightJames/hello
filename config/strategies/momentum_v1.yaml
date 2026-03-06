@@ -77,6 +77,8 @@ signals:
   fast_exit:
     enabled: true
     exit_on_3m_breakdown: true     # Sell if 3m return < benchmark
+    check_frequency: daily         # Run fast exit scan every day, not just on rebalance
+    cooldown_days: 5               # After exiting, wait 5 trading days before re-buying same symbol
 
 regime_filter:
   enabled: true
@@ -88,6 +90,7 @@ allocation:
   min_trade_dollars: 1.00         # Alpaca supports fractional shares down to $1
 
 rebalance:
-  frequency: weekly               # Weekly to align with deposit cadence (was monthly)
-  expected_turnover: "1-2 trades per week"
+  frequency: weekly               # Full re-rank weekly (new BUYs, position sizing)
+  fast_exit_frequency: daily      # Fast exit scan runs every trading day
+  expected_turnover: "1-3 trades per week"
   typical_holding_period: "1-4 weeks"
