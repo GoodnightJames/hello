@@ -158,9 +158,11 @@ def apply_regime_filter(signals, regime, strategy_name, session):
             )
 
         elif signal_type == "BUY":
+            signal_strength = sig.get("signal_strength", 1.0)
             reason = (
                 f"BUY: Top-ranked asset with positive absolute momentum. "
                 f"12m return: {sig.get('score', 0):.4f}. "
+                f"Strength: {signal_strength:.2f}. "
                 f"Position multiplier: {multiplier:.2f}"
             )
             decision = store_decision(
@@ -177,6 +179,7 @@ def apply_regime_filter(signals, regime, strategy_name, session):
                 "signal_type": signal_type,
                 "signal_id": signal_id,
                 "position_multiplier": multiplier,
+                "signal_strength": signal_strength,
                 "risk_approved": True,
             })
 

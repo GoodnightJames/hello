@@ -244,14 +244,16 @@ def _execute_alpaca_buy(session, decision, portfolio, prices, risk_result):
             "reason": "No price data available for sizing",
         }
 
-    # Calculate allocation — deploy almost all available cash
-    # For small accounts ($100/week), sitting in cash is the biggest risk.
-    # max_trade_size from risk enforcer already reflects the risk mode's
-    # deployment percentage (50%/90%/95% of cash).
+    # Calculate allocation — deploy available cash, scaled by signal strength.
+    # max_trade_size from risk enforcer reflects the risk mode's deployment %.
+    # Signal strength (0.1 to 2.0) scales the allocation: strong momentum = bigger position.
     from capital.manager import get_deployable_cash
     deployable = get_deployable_cash(portfolio)
     max_trade = risk_result.get("max_trade_size", deployable)
-    allocation = min(deployable, max_trade) * multiplier
+    signal_strength = decision.get("signal_strength", 1.0)
+    # Clamp strength between 0.5 and 1.0 for sizing (don't go below 50% or above 100% of max)
+    strength_factor = max(0.5, min(1.0, signal_strength))
+    allocation = min(deployable, max_trade) * multiplier * strength_factor
 
     shares = calculate_shares(allocation, price, fractional=True, min_notional=1.0)
     if shares <= 0:

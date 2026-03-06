@@ -6,7 +6,7 @@
 # The safety net is the regime filter and the momentum signal itself —
 # when momentum is negative, we rotate to bonds, not cash.
 
-version: "2.0.0"
+version: "3.0.0"
 name: dual_momentum_trend_core
 description: >
   Dual momentum with absolute and relative momentum signals.
@@ -27,6 +27,30 @@ signals:
   benchmark: SHY                  # T-bill proxy for absolute momentum
   absolute_momentum: true         # Compare return vs T-bills
   relative_momentum: true         # Rank assets by return
+
+  # --- Alpha Optimizations (v3.0) ---
+  # Multi-timeframe confirmation: require shorter-term alignment before buying
+  # Prevents buying into dying trends where 12m is positive but recent is negative
+  multi_timeframe:
+    enabled: true
+    require_6m_positive: true     # 6-month return must also beat benchmark
+    require_3m_positive: false    # 3-month not required (too noisy)
+
+  # Minimum edge: skip signals where excess return is trivially small
+  min_edge_pct: 0.02             # Require 2% excess return over benchmark
+
+  # RSI(2) overbought filter: avoid buying at short-term extremes
+  rsi_filter:
+    enabled: true
+    overbought_threshold: 90     # Don't buy above RSI(2) = 90
+    oversold_boost: 1.25         # Boost signal strength 25% when RSI(2) < 10
+
+  # Signal strength: composite score for position sizing
+  signal_strength:
+    enabled: true
+    weight_12m: 0.50             # 12-month return (primary)
+    weight_6m: 0.30              # 6-month return (confirmation)
+    weight_3m: 0.20              # 3-month return (acceleration)
 
 regime_filter:
   enabled: true
