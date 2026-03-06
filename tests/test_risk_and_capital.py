@@ -44,13 +44,19 @@ def risk_params():
 
 class TestMaxTradeSize:
     def test_500_portfolio(self, risk_params):
-        # 0.5% of $500 = $2.50
+        # 1% of $500 = $5.00
         result = calculate_max_trade_size(risk_params, 500)
-        assert result == pytest.approx(2.50)
+        assert result == pytest.approx(5.00)
 
     def test_1000_portfolio(self, risk_params):
+        # 1% of $1000 = $10.00
         result = calculate_max_trade_size(risk_params, 1000)
-        assert result == pytest.approx(5.00)
+        assert result == pytest.approx(10.00)
+
+    def test_100k_portfolio(self, risk_params):
+        # 1% of $100,000 = $1,000
+        result = calculate_max_trade_size(risk_params, 100_000)
+        assert result == pytest.approx(1000.00)
 
     def test_zero_equity(self, risk_params):
         result = calculate_max_trade_size(risk_params, 0)
@@ -163,7 +169,7 @@ class TestValidateOrder:
         state = {"total_equity": 1000}
         result = validate_order(session, risk_params, decision, state)
         assert result["approved"] is True
-        assert result["max_trade_size"] == pytest.approx(5.0)
+        assert result["max_trade_size"] == pytest.approx(10.0)
 
     def test_kill_switch_blocks(self, session, risk_params):
         os.environ["KILL_SWITCH"] = "true"

@@ -1,26 +1,26 @@
-# Risk Parameters — v1.1 (small account $500-$1000)
+# Risk Parameters — v2.0 ($100k paper trading account)
 # These values are hard limits enforced by the risk engine.
 # The risk engine overrides every other module.
 
 position_limits:
-  max_risk_per_trade: 0.005       # 0.5% of portfolio per trade (overridden by risk_mode)
-  max_concurrent_positions: 3     # (overridden by risk_mode)
-  averaging_down: false            # NEVER — hard rule
+  max_risk_per_trade: 0.01          # 1% of portfolio per trade (overridden by risk_mode)
+  max_concurrent_positions: 5       # (overridden by risk_mode)
+  averaging_down: false             # NEVER — hard rule
 
 daily_limits:
-  max_daily_loss: 0.02            # 2% — triggers shutdown
-  max_weekly_drawdown: 0.05       # 5% — triggers review
+  max_daily_loss: 0.02              # 2% — triggers shutdown ($2,000 on $100k)
+  max_weekly_drawdown: 0.05         # 5% — triggers review ($5,000 on $100k)
 
 shutdown_rules:
-  consecutive_loss_shutdown: 3    # 3 losses in a row — halt trading
+  consecutive_loss_shutdown: 3      # 3 losses in a row — halt trading
 
 regime_throttles:
-  vix_threshold: 30               # VIX > 30 triggers throttle
-  vix_position_reduce: 0.50       # Reduce position size by 50%
-  spy_below_200d_reduce: 0.50     # Reduce position size by 50%
+  vix_threshold: 30                 # VIX > 30 triggers throttle
+  vix_position_reduce: 0.50         # Reduce position size by 50%
+  spy_below_200d_reduce: 0.50       # Reduce position size by 50%
 
 kill_switch:
-  env_var: KILL_SWITCH            # Set to "true" in .env to halt all execution
+  env_var: KILL_SWITCH              # Set to "true" in .env to halt all execution
   description: "File-based kill switch — halts all execution when activated"
 
 # ─── Performance-Based Risk Modes ───────────────────────────────────────────
@@ -29,39 +29,49 @@ kill_switch:
 
 risk_modes:
   conservative:
-    risk_per_trade_pct: 0.003     # 0.3% risk per trade
-    max_positions: 2
-    deploy_deposits: false        # Hold deposits in cash buffer
+    risk_per_trade_pct: 0.005       # 0.5% risk per trade ($500 on $100k)
+    max_positions: 3
+    deploy_deposits: false          # Hold deposits in cash buffer
 
   normal:
-    risk_per_trade_pct: 0.005     # 0.5% risk per trade
-    max_positions: 3
-    deploy_deposits: true         # Deploy deposits normally
+    risk_per_trade_pct: 0.01        # 1.0% risk per trade ($1,000 on $100k)
+    max_positions: 5
+    deploy_deposits: true           # Deploy deposits normally
 
   aggressive:
-    risk_per_trade_pct: 0.008     # 0.8% risk per trade
-    max_positions: 4
-    deploy_deposits: true         # Deploy deposits immediately
+    risk_per_trade_pct: 0.015       # 1.5% risk per trade ($1,500 on $100k)
+    max_positions: 6
+    deploy_deposits: true           # Deploy deposits immediately
 
 # Thresholds for mode transitions
 mode_transitions:
   # Upgrade to aggressive
   aggressive_trigger:
-    min_rolling_return: 0.08      # 8% gain over lookback window
-    max_drawdown: 0.04            # Drawdown must be under 4%
-    lookback_days: 60             # 60 trading days
+    min_rolling_return: 0.08        # 8% gain over lookback window
+    max_drawdown: 0.04              # Drawdown must be under 4%
+    lookback_days: 60               # 60 trading days
 
   # Downgrade to conservative
   conservative_trigger:
-    max_drawdown: 0.05            # 5% drawdown triggers conservative
-    max_consecutive_losses: 4     # 4 consecutive losing trades
+    max_drawdown: 0.05              # 5% drawdown triggers conservative
+    max_consecutive_losses: 4       # 4 consecutive losing trades
 
   # Return to normal (from either direction)
   normal_trigger:
-    min_rolling_return: 0.0       # Positive returns
-    max_drawdown: 0.05            # Drawdown under 5%
-    min_days_in_mode: 10          # Stay in mode at least 10 trading days
+    min_rolling_return: 0.0         # Positive returns
+    max_drawdown: 0.05              # Drawdown under 5%
+    min_days_in_mode: 10            # Stay in mode at least 10 trading days
 
 # Trade frequency limit — prevents overtrading in noisy markets
 trade_throttle:
-  max_trades_per_week: 5
+  max_trades_per_week: 8
+
+# ─── 30-Day Go-Live Criteria ─────────────────────────────────────────────────
+# These thresholds must ALL be met before switching to real money.
+go_live_criteria:
+  min_days_trading: 30              # Minimum calendar days of paper trading
+  min_trades: 10                    # At least 10 round-trip trades
+  max_drawdown: 0.10               # Max drawdown under 10%
+  min_win_rate: 0.40                # Win rate above 40%
+  min_profit_factor: 1.0            # Gross profit / gross loss >= 1.0
+  max_daily_loss_events: 2          # No more than 2 daily loss shutdowns

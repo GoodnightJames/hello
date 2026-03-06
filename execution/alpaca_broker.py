@@ -12,6 +12,7 @@ All other modules go through this interface.
 """
 
 import os
+import time
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -209,3 +210,45 @@ def cancel_all_orders():
         extra={"extra_data": {"count": len(cancelled) if cancelled else 0}},
     )
     return cancelled
+
+
+def _retry(func, max_retries=3, base_delay=2):
+    """
+    Retry a function with exponential backoff for transient network errors.
+
+    Only retries on connection/timeout errors, NOT on API rejections
+    (e.g., insufficient funds, invalid symbol).
+    """
+    from requests.exceptions import ConnectionError, Timeout, ProxyError
+
+    for attempt in range(max_retries + 1):
+        try:
+            return func()
+        except (ConnectionError, Timeout, ProxyError, OSError) as e:
+            if attempt == max_retries:
+                logger.error(
+                    f"API call failed after {max_retries} retries",
+                    extra={"extra_data": {"error": str(e)}},
+                )
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                f"API call failed (attempt {attempt + 1}), retrying in {delay}s",
+                extra={"extra_data": {"error": str(e)}},
+            )
+            time.sleep(delay)
+
+
+def submit_market_order_with_retry(symbol, qty, side, max_retries=3):
+    """Submit a market order with automatic retry on network errors."""
+    return _retry(lambda: submit_market_order(symbol, qty, side), max_retries=max_retries)
+
+
+def get_account_with_retry(max_retries=3):
+    """Fetch account info with automatic retry on network errors."""
+    return _retry(get_account, max_retries=max_retries)
+
+
+def get_positions_with_retry(max_retries=3):
+    """Fetch positions with automatic retry on network errors."""
+    return _retry(get_positions, max_retries=max_retries)

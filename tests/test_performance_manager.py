@@ -238,27 +238,27 @@ class TestSelectRiskMode:
 class TestGetModeParams:
     def test_conservative_params(self, risk_params):
         params = get_mode_params(risk_params, MODE_CONSERVATIVE)
-        assert params["risk_per_trade_pct"] == 0.003
-        assert params["max_positions"] == 2
+        assert params["risk_per_trade_pct"] == 0.005
+        assert params["max_positions"] == 3
         assert params["deploy_deposits"] is False
 
     def test_normal_params(self, risk_params):
         params = get_mode_params(risk_params, MODE_NORMAL)
-        assert params["risk_per_trade_pct"] == 0.005
-        assert params["max_positions"] == 3
+        assert params["risk_per_trade_pct"] == 0.01
+        assert params["max_positions"] == 5
         assert params["deploy_deposits"] is True
 
     def test_aggressive_params(self, risk_params):
         params = get_mode_params(risk_params, MODE_AGGRESSIVE)
-        assert params["risk_per_trade_pct"] == 0.008
-        assert params["max_positions"] == 4
+        assert params["risk_per_trade_pct"] == 0.015
+        assert params["max_positions"] == 6
         assert params["deploy_deposits"] is True
 
     def test_unknown_mode_uses_base_defaults(self, risk_params):
         params = get_mode_params(risk_params, "unknown_mode")
         # Falls back to base position_limits
-        assert params["risk_per_trade_pct"] == 0.005
-        assert params["max_positions"] == 3
+        assert params["risk_per_trade_pct"] == 0.01
+        assert params["max_positions"] == 5
 
 
 # ── Integration: risk enforcer with modes ──────────────────────────────────
@@ -275,8 +275,8 @@ class TestRiskEnforcerModeIntegration:
         conservative_size = calculate_max_trade_size(risk_params, 1000, mode_params=conservative_params)
 
         assert conservative_size < normal_size
-        assert normal_size == pytest.approx(5.0)       # 0.5% of 1000
-        assert conservative_size == pytest.approx(3.0)  # 0.3% of 1000
+        assert normal_size == pytest.approx(10.0)      # 1.0% of 1000
+        assert conservative_size == pytest.approx(5.0)  # 0.5% of 1000
 
     def test_aggressive_mode_increases_trade_size(self, session, risk_params):
         from risk.enforcer import calculate_max_trade_size
@@ -288,15 +288,15 @@ class TestRiskEnforcerModeIntegration:
         normal_size = calculate_max_trade_size(risk_params, 1000, mode_params=normal_params)
 
         assert agg_size > normal_size
-        assert agg_size == pytest.approx(8.0)  # 0.8% of 1000
+        assert agg_size == pytest.approx(15.0)  # 1.5% of 1000
 
     def test_conservative_mode_limits_positions(self, session, risk_params):
         from risk.enforcer import check_position_limits
 
         conservative_params = get_mode_params(risk_params, MODE_CONSERVATIVE)
 
-        # Fill up to conservative max (2)
-        for i in range(2):
+        # Fill up to conservative max (3)
+        for i in range(3):
             state = PortfolioState(
                 date=datetime.utcnow(),
                 cash=100,

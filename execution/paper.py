@@ -36,10 +36,10 @@ from execution.order_manager import (
     mark_order_rejected,
 )
 from execution.alpaca_broker import (
-    submit_market_order,
+    submit_market_order_with_retry as submit_market_order,
     get_order_status,
-    get_account,
-    get_positions as get_alpaca_positions,
+    get_account_with_retry as get_account,
+    get_positions_with_retry as get_alpaca_positions,
 )
 
 logger = get_logger("execution.paper")
