@@ -28,6 +28,7 @@ from capital.manager import (
     save_portfolio_snapshot,
 )
 from risk.enforcer import load_risk_params, validate_order
+from risk.trailing_stop import update_high_water_marks, check_trailing_stops, clear_high_water
 from execution.order_manager import (
     calculate_shares,
     create_order,
@@ -82,6 +83,10 @@ def sync_portfolio_from_alpaca(session):
         positions=position_qtys,
         prices=prices,
     )
+
+    # Update high-water marks for trailing stop tracking
+    if prices:
+        update_high_water_marks(session, prices)
 
     logger.info(
         "Portfolio synced from Alpaca",
@@ -145,6 +150,24 @@ def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
     try:
         # Sync portfolio from Alpaca before executing
         portfolio = sync_portfolio_from_alpaca(session)
+
+        # Check trailing stops — inject SELL decisions for triggered positions
+        positions_alpaca = get_alpaca_positions()
+        if positions_alpaca:
+            position_prices = {sym: pos["current_price"] for sym, pos in positions_alpaca.items()}
+            stop_triggered = check_trailing_stops(session, position_prices, risk_params)
+            for sym in stop_triggered:
+                # Prepend trailing stop sell before regular decisions
+                decisions.insert(0, {
+                    "symbol": sym,
+                    "action": "SELL",
+                    "reason": f"TRAILING STOP: {sym} dropped 8% from peak",
+                    "signal_type": "SELL",
+                    "signal_id": None,
+                    "position_multiplier": 1.0,
+                    "risk_approved": True,
+                })
+                logger.warning(f"Trailing stop SELL injected for {sym}")
 
         # Collect symbols we need prices for (pre-trade sizing)
         symbols = list(set(d["symbol"] for d in decisions if d.get("action") in ("BUY", "SELL")))
@@ -359,6 +382,9 @@ def _execute_alpaca_sell(session, decision, portfolio):
 
             mark_order_filled(session, order["id"], filled_price=filled_price, filled_qty=filled_qty)
             update_position(session, symbol, qty_change=-filled_qty, price=filled_price, current_state=portfolio)
+
+            # Clear high-water mark since position is closed
+            clear_high_water(session, symbol)
 
             total_proceeds = filled_qty * filled_price
             logger.info(

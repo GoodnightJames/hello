@@ -203,6 +203,24 @@ class CostBasis(Base):
     __table_args__ = (Index("ix_cost_basis_symbol", "symbol"),)
 
 
+class PositionHighWater(Base):
+    """High-water mark tracker for trailing stop-loss per position.
+
+    Updated daily from Alpaca position data. When current price drops
+    trailing_stop_pct below the high-water mark, a SELL signal is generated.
+    """
+
+    __tablename__ = "position_high_water"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(10), nullable=False, unique=True)
+    high_price = Column(Float, nullable=False)        # Highest price since entry
+    entry_price = Column(Float, nullable=False)        # Price at entry
+    last_updated = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (Index("ix_position_high_water_symbol", "symbol"),)
+
+
 class Deposit(Base):
     """Weekly deposit log."""
 

@@ -24,6 +24,11 @@ regime_throttles:
   vix_position_reduce: 0.50         # Reduce position size by 50% (unchanged)
   spy_below_200d_reduce: 0.50       # Reduce position size by 50% (unchanged)
 
+trailing_stop:
+  enabled: true
+  stop_pct: 0.08                    # Sell if price drops 8% from high-water mark
+  min_gain_to_activate: 0.03        # Only activate after 3% gain from entry (let winners run first)
+
 kill_switch:
   env_var: KILL_SWITCH
   description: "Emergency halt — set to 'true' in .env to stop all trading"

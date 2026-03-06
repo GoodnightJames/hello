@@ -15,12 +15,26 @@ description: >
   accumulation accounts deploying $100/week.
 
 instruments:
+  # Expanded risk universe (v3.0): more assets = more momentum opportunities.
+  # With only SPY/QQQ, the strategy trades ~1x/month. With sector ETFs,
+  # there's almost always SOMETHING with strong momentum to ride.
   risk_assets:
     - SPY   # S&P 500
     - QQQ   # Nasdaq 100
+    - IWM   # Russell 2000 (small-cap momentum)
+    - XLK   # Technology sector
+    - XLE   # Energy sector
+    - XLF   # Financials sector
+    - XLV   # Health Care sector
+    - XLI   # Industrials sector
+    - XLY   # Consumer Discretionary
+    - GLD   # Gold (commodity momentum)
+    - VNQ   # REITs (real estate momentum)
+    - EFA   # International developed
   safe_assets:
     - AGG   # US Aggregate Bond
     - SHY   # 1-3 Year Treasury (cash proxy / T-bill proxy)
+    - TLT   # 20+ Year Treasury (long bonds for rate-cut environments)
 
 signals:
   lookback_days: 252              # 12-month return (~252 trading days)
