@@ -32,7 +32,7 @@ from data.db import init_db, get_session
 from data.ingestion import ingest_daily
 from decision.engine import run_decision_engine, run_daily_decision_engine
 from execution.paper import execute_paper_decisions
-from capital.manager import get_or_create_portfolio, save_portfolio_snapshot
+from capital.manager import get_or_create_portfolio, save_portfolio_snapshot, record_deposit
 from data.feature_store import get_price_history
 from review.weekly_report import generate_weekly_report
 from execution.paper import sync_portfolio_from_alpaca
@@ -57,6 +57,83 @@ def check_kill_switch():
         logger.warning("KILL SWITCH ACTIVATED — halting all execution")
         return True
     return False
+
+
+def run_weekly_deposit():
+    """Scheduled job: record weekly $100 deposit (Monday 07:30 ET)."""
+    if check_kill_switch():
+        return
+
+    if not is_market_open():
+        logger.info("Market closed today (holiday) — skipping deposit")
+        return
+
+    logger.info("Processing weekly deposit")
+    try:
+        session = get_session()
+
+        # Get current performance mode so deposit respects conservative buffering
+        from risk.enforcer import load_risk_params
+        from performance.manager import select_risk_mode, get_mode_params
+        risk_params = load_risk_params()
+        mode_result = select_risk_mode(session, risk_params)
+        mode_params = get_mode_params(risk_params, mode_result["mode"])
+
+        portfolio = record_deposit(session, mode_params=mode_params)
+        session.commit()
+
+        logger.info(
+            "Weekly deposit complete",
+            extra={
+                "extra_data": {
+                    "cash": portfolio["cash"],
+                    "total_equity": portfolio["total_equity"],
+                    "risk_mode": mode_result["mode"],
+                }
+            },
+        )
+        session.close()
+    except Exception as e:
+        logger.error(
+            "Weekly deposit failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+
+
+def run_performance_check():
+    """Scheduled job: log current performance mode (daily 08:15 ET)."""
+    if check_kill_switch():
+        return
+
+    if not is_market_open():
+        return
+
+    try:
+        session = get_session()
+        from risk.enforcer import load_risk_params
+        from performance.manager import select_risk_mode
+
+        risk_params = load_risk_params()
+        mode_result = select_risk_mode(session, risk_params)
+
+        logger.info(
+            "Performance mode check",
+            extra={
+                "extra_data": {
+                    "mode": mode_result["mode"],
+                    "reason": mode_result.get("reason", ""),
+                    "metrics": mode_result.get("metrics", {}),
+                }
+            },
+        )
+        session.close()
+    except Exception as e:
+        logger.error(
+            "Performance check failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
 
 
 def run_daily_ingestion():
@@ -299,6 +376,22 @@ def main():
     # Set up scheduler
     scheduler = BlockingScheduler(timezone=tz)
 
+    # Job 0a: Weekly deposit (Monday 07:30)
+    scheduler.add_job(
+        run_weekly_deposit,
+        trigger=CronTrigger(day_of_week="mon", hour=7, minute=30, timezone=tz),
+        id="weekly_deposit",
+        name="Weekly $100 Deposit",
+    )
+
+    # Job 0b: Daily performance mode check (08:15)
+    scheduler.add_job(
+        run_performance_check,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=8, minute=15, timezone=tz),
+        id="performance_check",
+        name="Performance Mode Check",
+    )
+
     # Job 1: Daily data ingestion (08:00)
     scheduler.add_job(
         run_daily_ingestion,
@@ -340,6 +433,8 @@ def main():
     )
 
     jobs = [
+        {"id": "weekly_deposit", "trigger": f"Monday at 07:30 {tz}"},
+        {"id": "performance_check", "trigger": f"Mon-Fri at 08:15 {tz}"},
         {"id": "daily_ingestion", "trigger": f"Mon-Fri at {schedule['data_ingestion']} {tz}"},
         {"id": "signal_and_decision", "trigger": f"Mon-Fri at {schedule['signal_scoring']} {tz}"},
         {"id": "paper_execution", "trigger": f"Mon-Fri at {schedule['decision_engine']} {tz}"},
