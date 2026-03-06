@@ -136,8 +136,17 @@ def compute_rsi(prices, period=2):
     avg_gain = gain.rolling(window=period).mean()
     avg_loss = loss.rolling(window=period).mean()
 
-    rs = avg_gain / avg_loss.replace(0, float("inf"))
+    # Standard RS calculation
+    rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
+
+    # When avg_loss is zero (no losses), RSI should be 100
+    no_loss = avg_loss.abs() < 1e-15
+    rsi = rsi.where(~no_loss, 100.0)
+
+    # When avg_gain is zero (no gains), RSI should be 0
+    no_gain = avg_gain.abs() < 1e-15
+    rsi = rsi.where(~no_gain, 0.0)
 
     logger.info(
         "Computed RSI",
