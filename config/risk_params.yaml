@@ -1,0 +1,24 @@
+# Risk Parameters — v1 (small account $500-$1000)
+# These values are hard limits enforced by the risk engine.
+# The risk engine overrides every other module.
+
+position_limits:
+  max_risk_per_trade: 0.005       # 0.5% of portfolio per trade
+  max_concurrent_positions: 3
+  averaging_down: false            # NEVER — hard rule
+
+daily_limits:
+  max_daily_loss: 0.02            # 2% — triggers shutdown
+  max_weekly_drawdown: 0.05       # 5% — triggers review
+
+shutdown_rules:
+  consecutive_loss_shutdown: 3    # 3 losses in a row — halt trading
+
+regime_throttles:
+  vix_threshold: 30               # VIX > 30 triggers throttle
+  vix_position_reduce: 0.50       # Reduce position size by 50%
+  spy_below_200d_reduce: 0.50     # Reduce position size by 50%
+
+kill_switch:
+  env_var: KILL_SWITCH            # Set to "true" in .env to halt all execution
+  description: "File-based kill switch — halts all execution when activated"

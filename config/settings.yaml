@@ -1,0 +1,53 @@
+# Trading Engine Settings — v1.0
+# All timing in US/Eastern
+
+universe:
+  equities:
+    - SPY   # S&P 500
+    - QQQ   # Nasdaq 100
+    - IWM   # Russell 2000
+    - DIA   # Dow Jones
+    - AGG   # US Aggregate Bond
+    - SHY   # 1-3 Year Treasury (cash proxy)
+    - TLT   # 20+ Year Treasury
+    - XLF   # Financials
+    - XLE   # Energy
+    - XLK   # Technology
+    - XLV   # Health Care
+    - XLI   # Industrials
+    - XLP   # Consumer Staples
+    - XLU   # Utilities
+    - XLB   # Materials
+    - XLY   # Consumer Discretionary
+    - XLRE  # Real Estate
+    - VGK   # Europe
+    - VWO   # Emerging Markets
+    - GLD   # Gold
+    - SLV   # Silver
+    - EFA   # EAFE International
+    - EEM   # Emerging Markets (alt)
+    - VNQ   # REIT
+    - HYG   # High Yield Corporate Bond
+
+active_strategy: momentum_v1
+
+schedule:
+  timezone: US/Eastern
+  data_ingestion: "08:00"
+  signal_scoring: "08:30"
+  decision_engine: "09:25"
+  market_open: "09:30"
+  close_sync: "16:00"
+
+rebalance:
+  strategy_rebalance: monthly
+  equal_weight_rebalance: quarterly
+  drift_threshold: 0.10  # 10% drift triggers rebalance
+
+database:
+  url: "sqlite:///trading.db"
+
+logging:
+  directory: logs
+  level: INFO
+  format: json
