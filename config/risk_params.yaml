@@ -1,10 +1,10 @@
-# Risk Parameters — v1 (small account $500-$1000)
+# Risk Parameters — v1.1 (small account $500-$1000)
 # These values are hard limits enforced by the risk engine.
 # The risk engine overrides every other module.
 
 position_limits:
-  max_risk_per_trade: 0.005       # 0.5% of portfolio per trade
-  max_concurrent_positions: 3
+  max_risk_per_trade: 0.005       # 0.5% of portfolio per trade (overridden by risk_mode)
+  max_concurrent_positions: 3     # (overridden by risk_mode)
   averaging_down: false            # NEVER — hard rule
 
 daily_limits:
@@ -22,3 +22,46 @@ regime_throttles:
 kill_switch:
   env_var: KILL_SWITCH            # Set to "true" in .env to halt all execution
   description: "File-based kill switch — halts all execution when activated"
+
+# ─── Performance-Based Risk Modes ───────────────────────────────────────────
+# The performance manager selects a mode based on rolling equity performance.
+# The risk enforcer uses the active mode to override position_limits above.
+
+risk_modes:
+  conservative:
+    risk_per_trade_pct: 0.003     # 0.3% risk per trade
+    max_positions: 2
+    deploy_deposits: false        # Hold deposits in cash buffer
+
+  normal:
+    risk_per_trade_pct: 0.005     # 0.5% risk per trade
+    max_positions: 3
+    deploy_deposits: true         # Deploy deposits normally
+
+  aggressive:
+    risk_per_trade_pct: 0.008     # 0.8% risk per trade
+    max_positions: 4
+    deploy_deposits: true         # Deploy deposits immediately
+
+# Thresholds for mode transitions
+mode_transitions:
+  # Upgrade to aggressive
+  aggressive_trigger:
+    min_rolling_return: 0.08      # 8% gain over lookback window
+    max_drawdown: 0.04            # Drawdown must be under 4%
+    lookback_days: 60             # 60 trading days
+
+  # Downgrade to conservative
+  conservative_trigger:
+    max_drawdown: 0.05            # 5% drawdown triggers conservative
+    max_consecutive_losses: 4     # 4 consecutive losing trades
+
+  # Return to normal (from either direction)
+  normal_trigger:
+    min_rolling_return: 0.0       # Positive returns
+    max_drawdown: 0.05            # Drawdown under 5%
+    min_days_in_mode: 10          # Stay in mode at least 10 trading days
+
+# Trade frequency limit — prevents overtrading in noisy markets
+trade_throttle:
+  max_trades_per_week: 5

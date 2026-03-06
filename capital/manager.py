@@ -149,18 +149,31 @@ def save_portfolio_snapshot(session, cash, positions, prices=None):
     }
 
 
-def record_deposit(session, amount, notes=None):
+def record_deposit(session, amount, notes=None, mode_params=None):
     """
     Record a cash deposit (weekly $100 per spec).
+
+    When the performance mode is conservative, deposits are held in
+    a cash buffer instead of being counted toward deployable capital.
+    The deposit is always recorded, but the portfolio snapshot reflects
+    whether the cash is available for trading.
 
     Args:
         session: DB session.
         amount: Deposit amount.
         notes: Optional notes.
+        mode_params: Optional dict from performance.manager.get_mode_params().
+                     When deploy_deposits is False, deposit goes to cash
+                     but a note is added indicating it's buffered.
 
     Returns:
         Updated portfolio state dict.
     """
+    deploy = True
+    if mode_params and not mode_params.get("deploy_deposits", True):
+        deploy = False
+        notes = (notes or "") + " [BUFFERED — conservative mode, not deployed]"
+
     deposit = Deposit(
         amount=amount,
         date=datetime.utcnow(),
@@ -181,6 +194,7 @@ def record_deposit(session, amount, notes=None):
         extra={
             "extra_data": {
                 "amount": amount,
+                "deployed": deploy,
                 "new_cash": current["cash"],
                 "new_equity": current["total_equity"],
             }

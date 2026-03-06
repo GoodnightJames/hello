@@ -3,13 +3,14 @@ Risk Enforcer — hard limits that override all other modules.
 
 The risk engine is the final gate before any order submission.
 It enforces:
-1. Max risk per trade (0.5% of portfolio)
-2. Max concurrent positions (3)
+1. Max risk per trade (dynamic — set by performance mode)
+2. Max concurrent positions (dynamic — set by performance mode)
 3. No averaging down (NEVER)
 4. Daily loss limit (2% → shutdown)
 5. Weekly drawdown limit (5% → review mode)
 6. Consecutive loss shutdown (3 losses → halt)
 7. Kill switch (env var)
+8. Weekly trade throttle (max 5 trades/week)
 
 Every risk event is logged to the risk_events table.
 """
@@ -194,19 +195,26 @@ def check_consecutive_losses(session, risk_params):
     return False, details
 
 
-def check_position_limits(session, risk_params, proposed_symbol=None):
+def check_position_limits(session, risk_params, proposed_symbol=None, mode_params=None):
     """
     Check if adding a new position would exceed limits.
+
+    When mode_params is provided, max_positions comes from the active
+    performance mode instead of the base config.
 
     Args:
         session: DB session.
         risk_params: Risk parameters dict.
         proposed_symbol: Symbol we want to buy (None to just check count).
+        mode_params: Optional dict from performance.manager.get_mode_params().
 
     Returns:
         (bool, dict) — (can_open_position, details)
     """
-    max_positions = risk_params.get("position_limits", {}).get("max_concurrent_positions", 3)
+    if mode_params:
+        max_positions = mode_params.get("max_positions", 3)
+    else:
+        max_positions = risk_params.get("position_limits", {}).get("max_concurrent_positions", 3)
 
     # Get current open positions from the latest portfolio state
     latest_state = (
@@ -252,18 +260,25 @@ def check_position_limits(session, risk_params, proposed_symbol=None):
     return True, details
 
 
-def calculate_max_trade_size(risk_params, total_equity):
+def calculate_max_trade_size(risk_params, total_equity, mode_params=None):
     """
     Calculate maximum dollar amount per trade based on risk limits.
+
+    When mode_params is provided (from performance manager), the mode's
+    risk_per_trade_pct overrides the base config.
 
     Args:
         risk_params: Risk parameters dict.
         total_equity: Current total portfolio equity.
+        mode_params: Optional dict from performance.manager.get_mode_params().
 
     Returns:
         Float — maximum dollar risk per trade.
     """
-    max_risk_pct = risk_params.get("position_limits", {}).get("max_risk_per_trade", 0.005)
+    if mode_params:
+        max_risk_pct = mode_params.get("risk_per_trade_pct", 0.005)
+    else:
+        max_risk_pct = risk_params.get("position_limits", {}).get("max_risk_per_trade", 0.005)
     return total_equity * max_risk_pct
 
 
@@ -271,8 +286,9 @@ def validate_order(session, risk_params, decision, portfolio_state):
     """
     Full pre-trade risk validation for a single decision.
 
-    This is the final gate before order submission. Returns approval
-    status and reason.
+    This is the final gate before order submission. Incorporates
+    performance-based risk mode (conservative/normal/aggressive)
+    and the weekly trade throttle.
 
     Args:
         session: DB session.
@@ -286,15 +302,23 @@ def validate_order(session, risk_params, decision, portfolio_state):
             "approved": bool,
             "reason": str,
             "max_trade_size": float,
+            "risk_mode": str,
             "risk_checks": {check_name: passed}
         }
     """
     symbol = decision.get("symbol")
     action = decision.get("action")
 
+    # Determine active risk mode
+    from performance.manager import select_risk_mode, get_mode_params, check_trade_throttle
+
+    mode_result = select_risk_mode(session, risk_params)
+    mode = mode_result["mode"]
+    mode_params = get_mode_params(risk_params, mode)
+
     logger.info(
-        f"Validating order: {action} {symbol}",
-        extra={"extra_data": {"decision": decision}},
+        f"Validating order: {action} {symbol} (mode={mode})",
+        extra={"extra_data": {"decision": decision, "risk_mode": mode, "mode_params": mode_params}},
     )
 
     # Kill switch — absolute override
@@ -304,6 +328,7 @@ def validate_order(session, risk_params, decision, portfolio_state):
             "approved": False,
             "reason": "Kill switch is active",
             "max_trade_size": 0,
+            "risk_mode": mode,
             "risk_checks": {"kill_switch": False},
         }
 
@@ -313,6 +338,7 @@ def validate_order(session, risk_params, decision, portfolio_state):
             "approved": True,
             "reason": "Sells always approved for risk reduction",
             "max_trade_size": None,
+            "risk_mode": mode,
             "risk_checks": {"sell_always_approved": True},
         }
 
@@ -322,6 +348,7 @@ def validate_order(session, risk_params, decision, portfolio_state):
             "approved": True,
             "reason": f"{action} — no trade needed",
             "max_trade_size": 0,
+            "risk_mode": mode,
             "risk_checks": {},
         }
 
@@ -337,6 +364,7 @@ def validate_order(session, risk_params, decision, portfolio_state):
             "approved": False,
             "reason": f"Daily loss limit breached: {daily_details.get('daily_return', 0):.4%}",
             "max_trade_size": 0,
+            "risk_mode": mode,
             "risk_checks": checks,
         }
 
@@ -348,6 +376,7 @@ def validate_order(session, risk_params, decision, portfolio_state):
             "approved": False,
             "reason": f"Weekly drawdown limit breached: {weekly_details.get('weekly_return', 0):.4%}",
             "max_trade_size": 0,
+            "risk_mode": mode,
             "risk_checks": checks,
         }
 
@@ -359,28 +388,43 @@ def validate_order(session, risk_params, decision, portfolio_state):
             "approved": False,
             "reason": "Consecutive loss limit reached — trading halted",
             "max_trade_size": 0,
+            "risk_mode": mode,
             "risk_checks": checks,
         }
 
-    # Check 4: Position limits
-    can_open, pos_details = check_position_limits(session, risk_params, symbol)
+    # Check 4: Position limits (mode-aware)
+    can_open, pos_details = check_position_limits(session, risk_params, symbol, mode_params=mode_params)
     checks["position_limits"] = can_open
     if not can_open:
         return {
             "approved": False,
             "reason": pos_details.get("reason", "Position limit reached"),
             "max_trade_size": 0,
+            "risk_mode": mode,
             "risk_checks": checks,
         }
 
-    # All checks passed
-    max_trade = calculate_max_trade_size(risk_params, total_equity)
+    # Check 5: Weekly trade throttle
+    throttled, throttle_details = check_trade_throttle(session, risk_params)
+    checks["trade_throttle"] = not throttled
+    if throttled:
+        return {
+            "approved": False,
+            "reason": f"Weekly trade limit reached ({throttle_details['trades_this_week']}/{throttle_details['max_per_week']})",
+            "max_trade_size": 0,
+            "risk_mode": mode,
+            "risk_checks": checks,
+        }
+
+    # All checks passed — size uses mode-adjusted risk percentage
+    max_trade = calculate_max_trade_size(risk_params, total_equity, mode_params=mode_params)
 
     logger.info(
-        f"Order APPROVED: {action} {symbol}",
+        f"Order APPROVED: {action} {symbol} (mode={mode})",
         extra={
             "extra_data": {
                 "max_trade_size": max_trade,
+                "risk_mode": mode,
                 "risk_checks": checks,
             }
         },
@@ -390,5 +434,6 @@ def validate_order(session, risk_params, decision, portfolio_state):
         "approved": True,
         "reason": "All risk checks passed",
         "max_trade_size": max_trade,
+        "risk_mode": mode,
         "risk_checks": checks,
     }
