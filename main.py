@@ -33,6 +33,7 @@ from decision.engine import run_decision_engine
 from execution.paper import execute_paper_decisions
 from capital.manager import get_or_create_portfolio, save_portfolio_snapshot
 from data.feature_store import get_price_history
+from review.weekly_report import generate_weekly_report
 
 load_dotenv()
 logger = get_logger("main")
@@ -191,10 +192,34 @@ def run_eod_sync():
         )
 
 
+def run_weekly_report():
+    """Scheduled job: generate weekly performance report (Sunday)."""
+    logger.info("Generating weekly report")
+    try:
+        report = generate_weekly_report()
+        pnl = report.get("pnl", {})
+        logger.info(
+            "Weekly report generated",
+            extra={
+                "extra_data": {
+                    "weekly_pnl": pnl.get("weekly_pnl_pct", 0),
+                    "trades": len(report.get("trades", [])),
+                    "risk_events": len(report.get("risk_events", [])),
+                }
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "Weekly report failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+
+
 def main():
     """Initialize engine and start scheduler."""
     logger.info("=" * 60)
-    logger.info("Trading Engine starting — Phase 3 (Data + Signals + Execution)")
+    logger.info("Trading Engine starting (Data + Signals + Execution + Reporting)")
     logger.info("=" * 60)
 
     if check_kill_switch():
@@ -280,11 +305,20 @@ def main():
         name="End-of-Day Portfolio Sync",
     )
 
+    # Job 5: Weekly report (Sunday 10:00)
+    scheduler.add_job(
+        run_weekly_report,
+        trigger=CronTrigger(day_of_week="sun", hour=10, minute=0, timezone=tz),
+        id="weekly_report",
+        name="Weekly Performance Report",
+    )
+
     jobs = [
         {"id": "daily_ingestion", "trigger": f"Mon-Fri at {schedule['data_ingestion']} {tz}"},
         {"id": "signal_and_decision", "trigger": f"Mon-Fri at {schedule['signal_scoring']} {tz}"},
         {"id": "paper_execution", "trigger": f"Mon-Fri at {schedule['decision_engine']} {tz}"},
         {"id": "eod_sync", "trigger": f"Mon-Fri at {schedule['close_sync']} {tz}"},
+        {"id": "weekly_report", "trigger": f"Sunday at 10:00 {tz}"},
     ]
 
     logger.info(

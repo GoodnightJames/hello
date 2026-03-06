@@ -24,6 +24,7 @@ from core.logging import get_logger
 from data.db import Signal, Decision, get_session, init_db
 from data.feature_store import build_features
 from research.regime import classify_regime, load_risk_params
+from review.param_log import log_param_version
 from strategies.momentum_v1 import DualMomentumStrategy
 
 logger = get_logger("decision.engine")
@@ -233,9 +234,10 @@ def run_decision_engine(config_path="config/settings.yaml"):
     session = get_session()
 
     try:
-        # Step 1: Load strategy
+        # Step 1: Load strategy and log params
         logger.info(f"Loading strategy: {active_strategy}")
         strategy = DualMomentumStrategy()
+        log_param_version(strategy.name, strategy.config, session=session)
         instruments = strategy.get_instruments()
 
         # Ensure SPY is in the feature set for regime classification
