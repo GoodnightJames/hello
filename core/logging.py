@@ -11,6 +11,23 @@ import logging
 import os
 from datetime import datetime
 
+import numpy as np
+
+
+class _SafeEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+
+    def default(self, obj):
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
 
 class JSONFormatter(logging.Formatter):
     """Format log records as JSON lines."""
@@ -31,7 +48,7 @@ class JSONFormatter(logging.Formatter):
         if record.exc_info and record.exc_info[0] is not None:
             log_entry["exception"] = self.formatException(record.exc_info)
 
-        return json.dumps(log_entry)
+        return json.dumps(log_entry, cls=_SafeEncoder)
 
 
 def get_logger(name, log_dir="logs", level=None):

@@ -1,0 +1,308 @@
+"""
+Decision Engine — deterministic signal-to-decision pipeline.
+
+Same inputs = same output. No randomness.
+
+Pipeline:
+1. Load features from feature store
+2. Run strategy signal generation
+3. Classify regime
+4. Apply regime filter to signals
+5. Log every decision (including SKIPs with reason)
+6. Store decisions to database
+
+The decision engine does NOT execute trades. It produces decisions
+that the execution layer (Phase 3) will act on.
+"""
+
+import json
+from datetime import datetime
+
+import yaml
+
+from core.logging import get_logger
+from data.db import Signal, Decision, get_session, init_db
+from data.feature_store import build_features
+from research.regime import classify_regime, load_risk_params
+from strategies.momentum_v1 import DualMomentumStrategy
+
+logger = get_logger("decision.engine")
+
+
+def load_config(config_path="config/settings.yaml"):
+    """Load main settings config."""
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def store_signal(session, strategy_name, signal_dict):
+    """
+    Persist a signal to the database.
+
+    Returns the created Signal's id.
+    """
+    signal = Signal(
+        strategy=strategy_name,
+        symbol=signal_dict["symbol"],
+        date=datetime.utcnow(),
+        signal_type=signal_dict["signal_type"],
+        score=signal_dict.get("score"),
+        metadata_json=json.dumps(signal_dict.get("metadata", {})),
+    )
+    session.add(signal)
+    session.flush()  # Get the id before commit
+    return signal.id
+
+
+def store_decision(session, strategy_name, symbol, action, reason, signal_id=None, risk_approved=False):
+    """Persist a decision to the database."""
+    decision = Decision(
+        strategy=strategy_name,
+        symbol=symbol,
+        date=datetime.utcnow(),
+        action=action,
+        reason=reason,
+        signal_id=signal_id,
+        risk_approved=risk_approved,
+    )
+    session.add(decision)
+    return decision
+
+
+def apply_regime_filter(signals, regime, strategy_name, session):
+    """
+    Apply regime filters to signals, producing decisions.
+
+    Rules:
+    - If trend regime is risk_off AND signal is BUY on a risk asset → SKIP
+    - If trend regime is risk_off → rotate to safe asset (BUY SHY/AGG)
+    - Position multiplier applied by execution layer (stored in decision metadata)
+
+    Every signal produces a decision (BUY, SELL, HOLD, or SKIP).
+    Every decision is logged with reason.
+
+    Args:
+        signals: List of signal dicts from strategy.
+        regime: Dict from classify_regime().
+        strategy_name: Strategy identifier string.
+        session: SQLAlchemy session.
+
+    Returns:
+        List of decision dicts.
+    """
+    decisions = []
+    allow_entries = regime.get("allow_new_entries", True)
+    multiplier = regime.get("position_multiplier", 1.0)
+    trend = regime.get("trend", {})
+
+    for sig in signals:
+        symbol = sig["symbol"]
+        signal_type = sig["signal_type"]
+
+        # Store signal to DB
+        signal_id = store_signal(session, strategy_name, sig)
+
+        if signal_type == "BUY" and not allow_entries:
+            # Regime says no new entries — SKIP this BUY
+            reason = (
+                f"SKIP: Regime filter blocked BUY. "
+                f"SPY below 200d SMA ({trend.get('spy_price'):.2f} < {trend.get('spy_200d_sma'):.2f}). "
+                f"Holding cash."
+            ) if trend.get("spy_price") is not None else "SKIP: Regime risk_off — no new entries"
+
+            decision = store_decision(
+                session, strategy_name, symbol,
+                action="SKIP",
+                reason=reason,
+                signal_id=signal_id,
+                risk_approved=False,
+            )
+            decisions.append({
+                "symbol": symbol,
+                "action": "SKIP",
+                "reason": reason,
+                "signal_type": signal_type,
+                "signal_id": signal_id,
+                "position_multiplier": multiplier,
+                "risk_approved": False,
+            })
+
+            logger.info(
+                f"Decision: SKIP {symbol}",
+                extra={"extra_data": {"reason": reason, "signal_id": signal_id}},
+            )
+
+        elif signal_type == "SELL":
+            reason = f"SELL: No absolute momentum (12m return below benchmark)"
+            decision = store_decision(
+                session, strategy_name, symbol,
+                action="SELL",
+                reason=reason,
+                signal_id=signal_id,
+                risk_approved=True,  # Sells are always risk-approved
+            )
+            decisions.append({
+                "symbol": symbol,
+                "action": "SELL",
+                "reason": reason,
+                "signal_type": signal_type,
+                "signal_id": signal_id,
+                "position_multiplier": 1.0,
+                "risk_approved": True,
+            })
+
+            logger.info(
+                f"Decision: SELL {symbol}",
+                extra={"extra_data": {"reason": reason, "signal_id": signal_id}},
+            )
+
+        elif signal_type == "BUY":
+            reason = (
+                f"BUY: Top-ranked asset with positive absolute momentum. "
+                f"12m return: {sig.get('score', 0):.4f}. "
+                f"Position multiplier: {multiplier:.2f}"
+            )
+            decision = store_decision(
+                session, strategy_name, symbol,
+                action="BUY",
+                reason=reason,
+                signal_id=signal_id,
+                risk_approved=True,  # Risk validation happens at execution
+            )
+            decisions.append({
+                "symbol": symbol,
+                "action": "BUY",
+                "reason": reason,
+                "signal_type": signal_type,
+                "signal_id": signal_id,
+                "position_multiplier": multiplier,
+                "risk_approved": True,
+            })
+
+            logger.info(
+                f"Decision: BUY {symbol}",
+                extra={"extra_data": {"reason": reason, "signal_id": signal_id, "multiplier": multiplier}},
+            )
+
+        elif signal_type == "HOLD":
+            reason = f"HOLD: Asset has absolute momentum but is not top-ranked"
+            decision = store_decision(
+                session, strategy_name, symbol,
+                action="HOLD",
+                reason=reason,
+                signal_id=signal_id,
+                risk_approved=True,
+            )
+            decisions.append({
+                "symbol": symbol,
+                "action": "HOLD",
+                "reason": reason,
+                "signal_type": signal_type,
+                "signal_id": signal_id,
+                "position_multiplier": multiplier,
+                "risk_approved": True,
+            })
+
+            logger.info(
+                f"Decision: HOLD {symbol}",
+                extra={"extra_data": {"reason": reason, "signal_id": signal_id}},
+            )
+
+    return decisions
+
+
+def run_decision_engine(config_path="config/settings.yaml"):
+    """
+    Main decision engine pipeline.
+
+    Orchestrates: features → signals → regime → decisions.
+    All decisions logged to database and structured logs.
+
+    Returns:
+        List of decision dicts.
+    """
+    logger.info("=" * 50)
+    logger.info("Decision engine starting")
+    logger.info("=" * 50)
+
+    config = load_config(config_path)
+    active_strategy = config.get("active_strategy", "momentum_v1")
+
+    # Initialize DB
+    init_db()
+    session = get_session()
+
+    try:
+        # Step 1: Load strategy
+        logger.info(f"Loading strategy: {active_strategy}")
+        strategy = DualMomentumStrategy()
+        instruments = strategy.get_instruments()
+
+        # Ensure SPY is in the feature set for regime classification
+        feature_symbols = list(set(instruments + ["SPY"]))
+
+        # Step 2: Build features
+        logger.info("Building features from database")
+        features = build_features(feature_symbols, lookback_days=352)  # 252 + 100 buffer
+
+        if features["prices"].empty:
+            logger.warning("No price data in database — run data ingestion first")
+            return []
+
+        # Step 3: Generate signals
+        logger.info("Generating strategy signals")
+        signals = strategy.generate_signals(data=features)
+
+        if not signals:
+            logger.info("No signals generated — nothing to decide")
+            return []
+
+        # Step 4: Classify regime
+        logger.info("Classifying market regime")
+        risk_params = load_risk_params()
+        regime = classify_regime(features, risk_params)
+
+        # Step 5: Apply regime filter → produce decisions
+        logger.info("Applying regime filter to signals")
+        decisions = apply_regime_filter(signals, regime, strategy.name, session)
+
+        # Commit all signals and decisions
+        session.commit()
+
+        logger.info(
+            "Decision engine complete",
+            extra={
+                "extra_data": {
+                    "strategy": strategy.name,
+                    "signals_count": len(signals),
+                    "decisions_count": len(decisions),
+                    "regime": {
+                        "trend": regime["trend"]["trend_regime"],
+                        "vol": regime["volatility"]["vol_regime"],
+                        "multiplier": regime["position_multiplier"],
+                    },
+                    "decisions_summary": [
+                        {"symbol": d["symbol"], "action": d["action"]}
+                        for d in decisions
+                    ],
+                }
+            },
+        )
+        return decisions
+
+    except Exception as e:
+        session.rollback()
+        logger.error(
+            "Decision engine failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+        raise
+    finally:
+        session.close()
+
+
+if __name__ == "__main__":
+    decisions = run_decision_engine()
+    for d in decisions:
+        print(f"  {d['action']:5s} {d['symbol']:5s} — {d['reason']}")
