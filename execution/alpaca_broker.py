@@ -88,10 +88,13 @@ def get_positions():
     for pos in positions:
         # Normalize crypto symbols: Alpaca returns "BTCUSD" but we use "BTC/USD"
         symbol = pos.symbol
-        if hasattr(pos, 'asset_class') and str(getattr(pos, 'asset_class', '')) == 'crypto':
-            # Convert BTCUSD → BTC/USD
-            if '/' not in symbol and symbol.endswith('USD'):
-                symbol = symbol[:-3] + '/USD'
+        is_crypto = (
+            hasattr(pos, 'asset_class')
+            and pos.asset_class is not None
+            and pos.asset_class.value == 'crypto'
+        )
+        if is_crypto and '/' not in symbol and symbol.endswith('USD'):
+            symbol = symbol[:-3] + '/USD'
         result[symbol] = {
             "qty": float(pos.qty),
             "market_value": float(pos.market_value),
