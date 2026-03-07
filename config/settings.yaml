@@ -38,13 +38,20 @@ universe:
     - VNQ   # REIT
     - HYG   # High Yield Corporate Bond
   crypto:
-    - BTC/USD   # Bitcoin
-    - ETH/USD   # Ethereum
-    - SOL/USD   # Solana
+    - BTC/USD   # Bitcoin — baseline
+    - ETH/USD   # Ethereum — #2
+    - SOL/USD   # Solana — volatile L1
+    - DOGE/USD  # Dogecoin — meme, very volatile
+    - AVAX/USD  # Avalanche — volatile L1
+    - LINK/USD  # Chainlink — swings hard
+    - DOT/USD   # Polkadot — volatile mid-cap
+    - SHIB/USD  # Shiba Inu — huge swings
+    - PEPE/USD  # Pepe — extreme volatility
+    - XRP/USD   # Ripple — news-driven
 
 # Two-sleeve architecture:
 # - Equity momentum (70%): weekly rebalance, dual momentum, regime-filtered
-# - Crypto DCA (30%): every 8 hours, dollar-cost average, no filters
+# - Crypto active (30%): buy every 2h, exit checks every 15min
 #
 # Virtual sleeve accounting: one broker account, two internal cash ledgers.
 # Weekly deposit splits by these ratios. Each sleeve can only spend its own cash.
@@ -63,9 +70,11 @@ schedule:
   decision_engine: "09:25"
   market_open: "09:30"
   close_sync: "16:00"
-  # Crypto runs 24/7 — every 8 hours (3 cycles/day)
-  # Rotation model: one coin per cycle, $1.50 each = $4.50/day = $31.50/week
-  crypto_interval_hours: 8
+  # Crypto runs 24/7
+  # Buy cycles: every 2 hours (rotation through 10 coins)
+  # Exit checks: every 15 minutes (fast capture of short-term moves)
+  crypto_buy_interval_hours: 2
+  crypto_exit_interval_minutes: 15
   crypto_run_on_startup: true
 
 rebalance:

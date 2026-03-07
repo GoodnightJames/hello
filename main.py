@@ -660,24 +660,35 @@ def main():
         name="Weekly Performance Report",
     )
 
-    # ── Crypto Jobs (24/7 — every N hours, all 7 days) ─────────────────
-    crypto_interval = int(schedule.get("crypto_interval_hours", 2))
+    # ── Crypto Jobs (24/7 — all 7 days) ────────────────────────────────
+    crypto_buy_interval = int(schedule.get("crypto_buy_interval_hours", schedule.get("crypto_interval_hours", 2)))
+    crypto_exit_interval = int(schedule.get("crypto_exit_interval_minutes", 15))
     crypto_run_on_startup = schedule.get("crypto_run_on_startup", True)
 
-    # Job 6: Crypto data ingestion (every N hours, 7 days/week)
+    # Job 6: Crypto data ingestion (every 2 hours, 7 days/week)
     scheduler.add_job(
         run_crypto_ingestion,
-        trigger=IntervalTrigger(hours=crypto_interval),
+        trigger=IntervalTrigger(hours=crypto_buy_interval),
         id="crypto_ingestion",
-        name=f"Crypto OHLCV Data Ingestion (every {crypto_interval}h, 24/7)",
+        name=f"Crypto OHLCV Data Ingestion (every {crypto_buy_interval}h, 24/7)",
     )
 
-    # Job 7: Crypto DCA pipeline (every N hours)
+    # Job 7: Crypto BUY cycle (every 2 hours — rotation buys + exit check)
     scheduler.add_job(
         run_crypto_dca_cycle,
-        trigger=IntervalTrigger(hours=crypto_interval, minutes=5),
+        trigger=IntervalTrigger(hours=crypto_buy_interval, minutes=5),
         id="crypto_dca_cycle",
-        name=f"Crypto DCA Buy Cycle (every {crypto_interval}h, 24/7)",
+        name=f"Crypto Buy Cycle (every {crypto_buy_interval}h, 24/7)",
+    )
+
+    # Job 8: Crypto EXIT check (every 15 minutes — fast capture)
+    # This is the key speed advantage: catches take-profit/stop-loss
+    # opportunities within minutes, not hours.
+    scheduler.add_job(
+        run_crypto_exit_check,
+        trigger=IntervalTrigger(minutes=crypto_exit_interval),
+        id="crypto_exit_check",
+        name=f"Crypto Exit Check (every {crypto_exit_interval}min, 24/7)",
     )
 
     jobs = [
@@ -688,8 +699,9 @@ def main():
         {"id": "paper_execution", "trigger": f"Mon-Fri at {schedule['decision_engine']} {tz}"},
         {"id": "eod_sync", "trigger": f"Mon-Fri at {schedule['close_sync']} {tz}"},
         {"id": "weekly_report", "trigger": f"Sunday at 10:00 {tz}"},
-        {"id": "crypto_ingestion", "trigger": f"Every {crypto_interval}h (24/7)"},
-        {"id": "crypto_dca_cycle", "trigger": f"Every {crypto_interval}h +5min (24/7)"},
+        {"id": "crypto_ingestion", "trigger": f"Every {crypto_buy_interval}h (24/7)"},
+        {"id": "crypto_dca_cycle", "trigger": f"Every {crypto_buy_interval}h +5min (24/7)"},
+        {"id": "crypto_exit_check", "trigger": f"Every {crypto_exit_interval}min (24/7)"},
     ]
 
     logger.info(
