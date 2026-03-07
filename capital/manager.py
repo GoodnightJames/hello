@@ -591,7 +591,7 @@ def get_sleeve_deployable_cash(session, sleeve_name):
     Each sleeve can only spend its own virtual balance.
     """
     cash = get_sleeve_cash(session, sleeve_name)
-    buffer = min(1.0, cash * 0.05)
+    buffer = 0.01  # Minimal buffer — just avoid floating-point zero issues
     return max(0, cash - buffer)
 
 

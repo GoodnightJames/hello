@@ -90,8 +90,8 @@ class TestSleeveDeployableCash:
     def test_deployable_subtracts_buffer(self, session):
         deposit_to_sleeves(session, 100.0)
         deployable = get_sleeve_deployable_cash(session, SLEEVE_EQUITY)
-        # 70 - min(1.0, 70*0.05=3.50) = 70 - 1.0 = 69.0
-        assert deployable == pytest.approx(69.0)
+        # 70 - 0.01 buffer = 69.99
+        assert deployable == pytest.approx(69.99)
 
     def test_zero_cash_returns_zero(self, session):
         deployable = get_sleeve_deployable_cash(session, SLEEVE_CRYPTO)
