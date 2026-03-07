@@ -121,23 +121,27 @@ def submit_market_order(symbol, qty, side):
 
     order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
+    # Crypto orders require GTC; equities use DAY
+    is_crypto = "/" in symbol
+    tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
+
     # Use fractional qty if not a whole number
     qty_float = float(qty)
-    if qty_float == int(qty_float):
-        # Whole shares
+    if qty_float == int(qty_float) and not is_crypto:
+        # Whole shares (equities only)
         request = MarketOrderRequest(
             symbol=symbol,
             qty=int(qty_float),
             side=order_side,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=tif,
         )
     else:
-        # Fractional shares
+        # Fractional shares or crypto
         request = MarketOrderRequest(
             symbol=symbol,
             qty=round(qty_float, 6),
             side=order_side,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=tif,
         )
 
     order = client.submit_order(request)
