@@ -586,6 +586,47 @@ def score_dual_momentum(features, strategy_config, exit_log=None):
     benchmark = strategy_config.get("signals", {}).get("benchmark", "SHY")
     max_buy_signals = strategy_config.get("signals", {}).get("max_buy_signals", 1)
 
+    # --- Crypto fallback: fill NaN 12m returns from shorter timeframes ---
+    # Crypto symbols may not have 252 days of history yet. Rather than
+    # silently dropping them, use the best available return (6m → 3m → 1m)
+    # annualized to approximate a 12-month return.
+    crypto_symbols = [s for s in risk_assets + safe_assets if "/" in s]
+    if crypto_symbols and not returns_12m.empty:
+        fallback_chain = [
+            ("6m", 126, 252 / 126),   # annualize: multiply by 2
+            ("3m", 63, 252 / 63),     # annualize: multiply by 4
+            ("1m", 21, 252 / 21),     # annualize: multiply by 12
+        ]
+        latest_12m = returns_12m.iloc[-1]
+        filled_any = False
+
+        for sym in crypto_symbols:
+            if sym in latest_12m.index and pd.notna(latest_12m[sym]):
+                continue  # Already has 12m data, no fallback needed
+
+            for label, _days, annualize_factor in fallback_chain:
+                shorter = returns.get(label, pd.DataFrame())
+                if shorter.empty or sym not in shorter.columns:
+                    continue
+                val = shorter[sym].dropna()
+                if val.empty:
+                    continue
+
+                # Annualize the shorter return to make it comparable
+                annualized = float(val.iloc[-1]) * annualize_factor
+                returns_12m.at[returns_12m.index[-1], sym] = annualized
+                filled_any = True
+                logger.info(
+                    f"Crypto fallback: {sym} using {label} return "
+                    f"({val.iloc[-1]:.2%}) annualized to {annualized:.2%}",
+                )
+                break
+            else:
+                logger.warning(f"Crypto {sym}: no return data at any timeframe")
+
+        if filled_any:
+            logger.info("Crypto symbols backfilled into 12m returns via shorter timeframes")
+
     all_symbols = risk_assets + safe_assets
     available = [s for s in all_symbols if s in returns_12m.columns]
     missing = [s for s in all_symbols if s not in returns_12m.columns]
