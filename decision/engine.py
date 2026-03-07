@@ -146,12 +146,14 @@ def apply_regime_filter(signals, regime, strategy_name, session):
     for sig in signals:
         symbol = sig["symbol"]
         signal_type = sig["signal_type"]
+        is_crypto = "/" in symbol  # Crypto symbols use slash (BTC/USD, ETH/USD)
 
         # Store signal to DB
         signal_id = store_signal(session, strategy_name, sig)
 
-        if signal_type == "BUY" and not allow_entries:
+        if signal_type == "BUY" and not allow_entries and not is_crypto:
             # Regime says no new entries — SKIP this BUY
+            # Crypto is exempt: SPY's 200d SMA has nothing to do with crypto markets
             spy_price = trend.get("spy_price")
             spy_sma = trend.get("spy_200d_sma")
             if spy_price is not None and spy_sma is not None:

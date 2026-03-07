@@ -85,6 +85,13 @@ def compute_relative_momentum(returns_12m, symbols):
 
     latest = returns_12m.iloc[-1]
     available = [s for s in symbols if s in latest.index and pd.notna(latest[s])]
+    nan_symbols = [s for s in symbols if s in latest.index and pd.isna(latest[s])]
+
+    if nan_symbols:
+        logger.warning(
+            "Symbols with NaN 12m returns dropped from ranking (insufficient history)",
+            extra={"extra_data": {"dropped": nan_symbols}},
+        )
 
     ranked = sorted(available, key=lambda s: latest[s], reverse=True)
     result = [(s, float(latest[s])) for s in ranked]
@@ -581,6 +588,13 @@ def score_dual_momentum(features, strategy_config, exit_log=None):
 
     all_symbols = risk_assets + safe_assets
     available = [s for s in all_symbols if s in returns_12m.columns]
+    missing = [s for s in all_symbols if s not in returns_12m.columns]
+
+    if missing:
+        logger.warning(
+            "Symbols missing from return data (not enough history?)",
+            extra={"extra_data": {"missing": missing}},
+        )
 
     if not available:
         logger.warning("No strategy instruments found in data")
