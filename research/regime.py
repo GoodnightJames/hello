@@ -66,8 +66,23 @@ def classify_trend_regime(prices_df, sma_200d_df, reference_symbol="SPY"):
             "above_200d": False,
         }
 
-    latest_price = prices_df[reference_symbol].dropna().iloc[-1]
-    latest_sma = sma_200d_df[reference_symbol].dropna().iloc[-1]
+    price_series = prices_df[reference_symbol].dropna()
+    sma_series = sma_200d_df[reference_symbol].dropna()
+
+    if price_series.empty or sma_series.empty:
+        logger.warning(
+            f"Insufficient data for {reference_symbol} trend regime "
+            f"(prices: {len(price_series)}, SMA values: {len(sma_series)})"
+        )
+        return {
+            "trend_regime": REGIME_RISK_OFF,
+            "spy_price": float(price_series.iloc[-1]) if not price_series.empty else None,
+            "spy_200d_sma": None,
+            "above_200d": False,
+        }
+
+    latest_price = price_series.iloc[-1]
+    latest_sma = sma_series.iloc[-1]
 
     above_200d = latest_price > latest_sma
     regime = REGIME_RISK_ON if above_200d else REGIME_RISK_OFF
