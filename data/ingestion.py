@@ -127,6 +127,18 @@ def store_bars(df, session):
         logger.info("No valid bars to store")
         return 0
 
+    # Normalize timestamps to naive UTC for consistent comparison with DB
+    def _normalize_ts(ts):
+        """Strip timezone info so comparisons match SQLite naive datetimes."""
+        if hasattr(ts, 'tz') and ts.tz is not None:
+            return ts.tz_convert('UTC').tz_localize(None)
+        if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+            return ts.replace(tzinfo=None)
+        return ts
+
+    valid = valid.copy()
+    valid["timestamp"] = valid["timestamp"].apply(_normalize_ts)
+
     # Batch-check existing records (single query instead of N queries)
     symbols_in_batch = valid["symbol"].unique().tolist()
     dates_in_batch = valid["timestamp"].unique().tolist()
