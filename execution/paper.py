@@ -60,13 +60,47 @@ def get_latest_prices(symbols, session=None):
     """
     Get the most recent close price for each symbol from local data.
     Used for pre-trade sizing only — actual fills come from Alpaca.
-    """
-    prices_df = get_price_history(symbols, lookback_days=5, session=session)
-    if prices_df.empty:
-        return {}
 
-    latest = prices_df.iloc[-1]
-    return {symbol: float(latest[symbol]) for symbol in latest.index if latest[symbol] > 0}
+    Falls back to Alpaca live position prices for symbols not in local DB
+    (e.g., newly added crypto coins that haven't been ingested yet).
+    """
+    prices = {}
+
+    # Try local DB first
+    prices_df = get_price_history(symbols, lookback_days=5, session=session)
+    if not prices_df.empty:
+        latest = prices_df.iloc[-1]
+        prices = {symbol: float(latest[symbol]) for symbol in latest.index if latest[symbol] > 0}
+
+    # Fill missing symbols from Alpaca positions (live prices)
+    missing = [s for s in symbols if s not in prices]
+    if missing:
+        try:
+            alpaca_positions = get_alpaca_positions()
+            for sym in missing:
+                if sym in alpaca_positions:
+                    prices[sym] = alpaca_positions[sym]["current_price"]
+        except Exception:
+            pass  # Best effort — if Alpaca fails, we'll skip the symbol
+
+    # Last resort for crypto: use notional-based ordering (no price needed)
+    # Alpaca supports notional orders, but for now we estimate from the API
+    if missing:
+        try:
+            from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+            from alpaca.data.requests import CryptoLatestQuoteRequest
+            still_missing = [s for s in missing if s not in prices]
+            if still_missing:
+                client = CryptoHistoricalDataClient()
+                request = CryptoLatestQuoteRequest(symbol_or_symbols=still_missing)
+                quotes = client.get_crypto_latest_quote(request)
+                for sym, quote in quotes.items():
+                    if quote.ask_price and quote.ask_price > 0:
+                        prices[sym] = float(quote.ask_price)
+        except Exception:
+            pass  # Best effort
+
+    return prices
 
 
 def sync_portfolio_from_alpaca(session):
