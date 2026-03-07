@@ -31,6 +31,13 @@ instruments:
     - GLD   # Gold (commodity momentum)
     - VNQ   # REITs (real estate momentum)
     - EFA   # International developed
+    # Crypto — 24/7 momentum opportunities
+    - BTC/USD   # Bitcoin
+    - ETH/USD   # Ethereum
+    - SOL/USD   # Solana
+    - AVAX/USD  # Avalanche
+    - LINK/USD  # Chainlink
+    - DOT/USD   # Polkadot
   safe_assets:
     - AGG   # US Aggregate Bond
     - SHY   # 1-3 Year Treasury (cash proxy / T-bill proxy)

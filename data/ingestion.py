@@ -14,8 +14,8 @@ import yaml
 from dotenv import load_dotenv
 from sqlalchemy import func
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 from core.logging import get_logger
@@ -290,6 +290,173 @@ def backfill(symbols, start_date, end_date, config_path="config/settings.yaml"):
     except Exception as e:
         logger.error(
             "Backfill failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+        raise
+    finally:
+        session.close()
+
+
+def create_crypto_client():
+    """Create Alpaca crypto historical data client using .env credentials."""
+    api_key = os.getenv("ALPACA_API_KEY")
+    secret_key = os.getenv("ALPACA_SECRET_KEY")
+
+    if not api_key or not secret_key:
+        logger.error("Alpaca API keys not found in environment")
+        raise ValueError(
+            "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env"
+        )
+
+    logger.info("Created Alpaca crypto data client")
+    return CryptoHistoricalDataClient(api_key, secret_key)
+
+
+def fetch_crypto_bars(client, symbols, start_date, end_date):
+    """
+    Fetch daily OHLCV bars from Alpaca for crypto symbols.
+
+    Args:
+        client: CryptoHistoricalDataClient instance.
+        symbols: List of crypto symbols (e.g. ["BTC/USD", "ETH/USD"]).
+        start_date: Start date (datetime).
+        end_date: End date (datetime).
+
+    Returns:
+        pandas DataFrame with OHLCV data, or empty DataFrame on error.
+    """
+    logger.info(
+        "Fetching crypto daily bars",
+        extra={
+            "extra_data": {
+                "symbols": symbols,
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat(),
+            }
+        },
+    )
+
+    try:
+        request_params = CryptoBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame.Day,
+            start=start_date,
+            end=end_date,
+        )
+        bars = client.get_crypto_bars(request_params)
+        df = bars.df
+
+        if df.empty:
+            logger.info("No crypto bars returned from Alpaca")
+            return pd.DataFrame()
+
+        df = df.reset_index()
+        logger.info(
+            "Fetched crypto bars successfully",
+            extra={"extra_data": {"rows": len(df)}},
+        )
+        return df
+
+    except Exception as e:
+        logger.error(
+            "Failed to fetch crypto bars from Alpaca",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+        return pd.DataFrame()
+
+
+def ingest_crypto(config_path="config/settings.yaml"):
+    """
+    Crypto ingestion orchestrator — runs 24/7, no market calendar check.
+
+    Fetches daily crypto bars from Alpaca for the crypto universe.
+    """
+    logger.info("Starting crypto ingestion")
+
+    config = load_config(config_path)
+    symbols = config["universe"].get("crypto", [])
+
+    if not symbols:
+        logger.info("No crypto symbols configured — skipping")
+        return 0
+
+    init_db()
+    session = get_session()
+
+    try:
+        # Check last crypto bar date (use first crypto symbol as reference)
+        last_date = get_last_bar_date(session, symbol=symbols[0])
+        if last_date:
+            start_date = last_date + timedelta(days=1)
+        else:
+            start_date = datetime.now() - timedelta(days=365)
+
+        end_date = datetime.now() - timedelta(days=1)
+
+        if start_date >= end_date:
+            logger.info("Crypto data is up to date, nothing to fetch")
+            return 0
+
+        client = create_crypto_client()
+        df = fetch_crypto_bars(client, symbols, start_date, end_date)
+        count = store_bars(df, session)
+
+        logger.info(
+            "Crypto ingestion complete",
+            extra={"extra_data": {"new_bars": count}},
+        )
+        return count
+
+    except Exception as e:
+        logger.error(
+            "Crypto ingestion failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+        raise
+    finally:
+        session.close()
+
+
+def backfill_crypto(symbols, start_date, end_date):
+    """
+    One-time historical backfill for crypto symbols.
+
+    Args:
+        symbols: List of crypto symbols (e.g. ["BTC/USD", "ETH/USD"]).
+        start_date: Start date (datetime).
+        end_date: End date (datetime).
+    """
+    logger.info(
+        "Starting crypto backfill",
+        extra={
+            "extra_data": {
+                "symbols": symbols,
+                "start": start_date.isoformat(),
+                "end": end_date.isoformat(),
+            }
+        },
+    )
+
+    init_db()
+    session = get_session()
+
+    try:
+        client = create_crypto_client()
+        df = fetch_crypto_bars(client, symbols, start_date, end_date)
+        count = store_bars(df, session)
+
+        logger.info(
+            "Crypto backfill complete",
+            extra={"extra_data": {"new_bars": count}},
+        )
+        return count
+
+    except Exception as e:
+        logger.error(
+            "Crypto backfill failed",
             extra={"extra_data": {"error": str(e)}},
             exc_info=True,
         )

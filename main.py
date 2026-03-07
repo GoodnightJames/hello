@@ -29,7 +29,7 @@ from apscheduler.triggers.cron import CronTrigger
 from core.logging import get_logger
 from core.market_calendar import is_market_open
 from data.db import init_db, get_session
-from data.ingestion import ingest_daily
+from data.ingestion import ingest_daily, ingest_crypto
 from decision.engine import run_decision_engine, run_daily_decision_engine
 from execution.paper import execute_paper_decisions
 from capital.manager import get_or_create_portfolio, save_portfolio_snapshot, record_deposit
@@ -295,6 +295,120 @@ def run_eod_sync():
         )
 
 
+def run_crypto_ingestion():
+    """Scheduled job: run crypto data ingestion (24/7, no market calendar)."""
+    if check_kill_switch():
+        return
+
+    logger.info("Running scheduled crypto ingestion")
+    try:
+        count = ingest_crypto()
+        logger.info(
+            "Scheduled crypto ingestion complete",
+            extra={"extra_data": {"new_bars": count}},
+        )
+    except Exception as e:
+        logger.error(
+            "Scheduled crypto ingestion failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+
+
+def run_crypto_signal_and_decision():
+    """
+    Scheduled job: run signal scoring and decision engine for crypto.
+
+    Runs 24/7 — no market calendar check. Crypto never sleeps.
+    Uses the same momentum strategy but only scores crypto symbols.
+    """
+    global _pending_decisions
+
+    if check_kill_switch():
+        return
+
+    logger.info("Running crypto signal + decision engine")
+    try:
+        # Use the full decision engine — crypto symbols are in the strategy config
+        # and will be scored alongside any equity data available
+        decisions = run_decision_engine()
+
+        # Filter to only crypto decisions for execution
+        crypto_decisions = [
+            d for d in decisions if "/" in d["symbol"]
+        ]
+
+        if crypto_decisions:
+            _pending_decisions = crypto_decisions
+            logger.info(
+                "Crypto decision engine complete",
+                extra={
+                    "extra_data": {
+                        "total_decisions": len(decisions),
+                        "crypto_decisions": len(crypto_decisions),
+                        "summary": [
+                            {"symbol": d["symbol"], "action": d["action"]}
+                            for d in crypto_decisions
+                        ],
+                    }
+                },
+            )
+        else:
+            logger.info("Crypto decision engine: no crypto signals generated")
+
+    except Exception as e:
+        logger.error(
+            "Crypto decision engine failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+
+
+def run_crypto_execution():
+    """Scheduled job: execute pending crypto decisions."""
+    global _pending_decisions
+
+    if check_kill_switch():
+        return
+
+    # Only execute crypto decisions (symbol contains "/")
+    crypto_decisions = [d for d in _pending_decisions if "/" in d["symbol"]]
+
+    if not crypto_decisions:
+        logger.info("No pending crypto decisions to execute")
+        return
+
+    logger.info(
+        "Running crypto paper execution",
+        extra={"extra_data": {"decision_count": len(crypto_decisions)}},
+    )
+    try:
+        results = execute_paper_decisions(crypto_decisions)
+        # Remove executed crypto decisions from pending
+        _pending_decisions = [d for d in _pending_decisions if "/" not in d["symbol"]]
+
+        filled = [r for r in results if r.get("status") == "filled"]
+        logger.info(
+            "Crypto paper execution complete",
+            extra={
+                "extra_data": {
+                    "filled": len(filled),
+                    "total": len(results),
+                    "results": [
+                        {"symbol": r["symbol"], "action": r["action"], "status": r["status"]}
+                        for r in results
+                    ],
+                }
+            },
+        )
+    except Exception as e:
+        logger.error(
+            "Crypto paper execution failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+
+
 def run_weekly_report():
     """Scheduled job: generate weekly performance report (Sunday)."""
     logger.info("Generating weekly report")
@@ -432,6 +546,35 @@ def main():
         name="Weekly Performance Report",
     )
 
+    # ── Crypto Jobs (24/7 — every 6 hours, all 7 days) ──────────────────
+    crypto_ing_hours = schedule.get("crypto_ingestion_hours", "0,6,12,18")
+    crypto_sig_hours = schedule.get("crypto_signal_hours", "1,7,13,19")
+    crypto_exec_hours = schedule.get("crypto_execution_hours", "1,7,13,19")
+
+    # Job 6: Crypto data ingestion (every 6 hours, 7 days/week)
+    scheduler.add_job(
+        run_crypto_ingestion,
+        trigger=CronTrigger(hour=crypto_ing_hours, minute=0, timezone=tz),
+        id="crypto_ingestion",
+        name="Crypto OHLCV Data Ingestion (24/7)",
+    )
+
+    # Job 7: Crypto signal scoring + decisions (every 6 hours, 7 days/week)
+    scheduler.add_job(
+        run_crypto_signal_and_decision,
+        trigger=CronTrigger(hour=crypto_sig_hours, minute=0, timezone=tz),
+        id="crypto_signal_and_decision",
+        name="Crypto Signal + Decision Engine (24/7)",
+    )
+
+    # Job 8: Crypto paper execution (every 6 hours, 7 days/week)
+    scheduler.add_job(
+        run_crypto_execution,
+        trigger=CronTrigger(hour=crypto_exec_hours, minute=30, timezone=tz),
+        id="crypto_execution",
+        name="Crypto Paper Execution (24/7)",
+    )
+
     jobs = [
         {"id": "weekly_deposit", "trigger": f"Monday at 07:30 {tz}"},
         {"id": "performance_check", "trigger": f"Mon-Fri at 08:15 {tz}"},
@@ -440,6 +583,9 @@ def main():
         {"id": "paper_execution", "trigger": f"Mon-Fri at {schedule['decision_engine']} {tz}"},
         {"id": "eod_sync", "trigger": f"Mon-Fri at {schedule['close_sync']} {tz}"},
         {"id": "weekly_report", "trigger": f"Sunday at 10:00 {tz}"},
+        {"id": "crypto_ingestion", "trigger": f"Every 6h at {crypto_ing_hours}:00 {tz} (24/7)"},
+        {"id": "crypto_signal_and_decision", "trigger": f"Every 6h at {crypto_sig_hours}:00 {tz} (24/7)"},
+        {"id": "crypto_execution", "trigger": f"Every 6h at {crypto_exec_hours}:30 {tz} (24/7)"},
     ]
 
     logger.info(

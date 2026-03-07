@@ -37,6 +37,13 @@ universe:
     - EEM   # Emerging Markets (alt)
     - VNQ   # REIT
     - HYG   # High Yield Corporate Bond
+  crypto:
+    - BTC/USD   # Bitcoin
+    - ETH/USD   # Ethereum
+    - SOL/USD   # Solana
+    - AVAX/USD  # Avalanche
+    - LINK/USD  # Chainlink
+    - DOT/USD   # Polkadot
 
 active_strategy: momentum_v1
 
@@ -47,6 +54,10 @@ schedule:
   decision_engine: "09:25"
   market_open: "09:30"
   close_sync: "16:00"
+  # Crypto runs 24/7 — every 6 hours
+  crypto_ingestion_hours: "0,6,12,18"
+  crypto_signal_hours: "1,7,13,19"
+  crypto_execution_hours: "1,7,13,19"
 
 rebalance:
   strategy_rebalance: weekly        # Rebalance weekly to align with deposits
