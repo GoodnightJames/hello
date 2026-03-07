@@ -8,11 +8,10 @@
 # This is a separate sleeve from equity momentum — different market,
 # different time horizon, different logic.
 #
-# ROTATION MODEL (v1.1): With a $30/week crypto budget, splitting across
-# multiple coins per cycle produces sub-$1 trades (below Alpaca minimum).
-# Instead, each cycle buys ONE coin, rotating through the list.
-# Every 8h = 3 cycles/day = 21/week. Each coin gets ~7 buys/week.
-# $1.50/cycle × 21 = $31.50/week (cash-limited to actual available).
+# ROTATION MODEL (v1.1): With a $30/week crypto budget, each cycle buys
+# ONE coin rotating through the list. Alpaca requires $10 minimum per
+# crypto order, so each cycle deploys $10 when cash is available.
+# Every 8h = 3 cycles/day. Cash guard skips cycles when sleeve < $10.
 
 version: "1.1.0"
 name: crypto_dca_core
@@ -31,10 +30,9 @@ instruments:
 
 allocation:
   # Full cycle amount goes to ONE coin (rotation, not split)
-  # 3 cycles/day × $1.50 = $4.50/day = $31.50/week max
-  # Cash guard in run_crypto_dca_cycle limits actual spend to available cash
-  dollars_per_cycle: 1.50
-  min_trade_dollars: 1.00   # Alpaca minimum
+  # Cash guard in run_crypto_dca_cycle skips if sleeve cash < $10
+  dollars_per_cycle: 10.00
+  min_trade_dollars: 10.00  # Alpaca crypto minimum order size
 
   # Sleeve gets 30% of total capital allocation
   # (equity momentum gets the other 70%)
