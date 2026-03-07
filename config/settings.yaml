@@ -45,7 +45,12 @@ universe:
     - LINK/USD  # Chainlink
     - DOT/USD   # Polkadot
 
-active_strategy: momentum_v1
+# Two-sleeve architecture:
+# - Equity momentum (70%): weekly rebalance, dual momentum, regime-filtered
+# - Crypto DCA (30%): every 2 hours, dollar-cost average, no filters
+active_strategies:
+  equity: momentum_v1
+  crypto: crypto_dca_v1
 
 schedule:
   timezone: US/Eastern

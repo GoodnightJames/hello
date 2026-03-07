@@ -1,0 +1,43 @@
+# Crypto DCA Strategy — v1.0.0
+# Simple dollar-cost averaging into crypto assets.
+#
+# RATIONALE: Momentum strategies avoid falling markets (correct behavior),
+# but that means they miss bottoms. DCA accumulates during downtrends so
+# you're positioned when momentum eventually turns positive.
+#
+# This is a separate sleeve from equity momentum — different market,
+# different time horizon, different logic.
+
+version: "1.0.0"
+name: crypto_dca_core
+description: >
+  Dollar-cost average into crypto assets every cycle. No momentum filter,
+  no regime filter. Just buy a fixed dollar amount on schedule.
+  Market-cap weighted allocation across the crypto universe.
+
+instruments:
+  # Weighted allocation — market-cap roughly proportional
+  # Weights must sum to 1.0
+  assets:
+    - symbol: BTC/USD
+      weight: 0.40       # Bitcoin — dominant, most liquid
+    - symbol: ETH/USD
+      weight: 0.25       # Ethereum — #2 by market cap
+    - symbol: SOL/USD
+      weight: 0.15       # Solana — high-growth L1
+    - symbol: LINK/USD
+      weight: 0.08       # Chainlink — oracle infrastructure
+    - symbol: AVAX/USD
+      weight: 0.07       # Avalanche — L1 competitor
+    - symbol: DOT/USD
+      weight: 0.05       # Polkadot — interoperability play
+
+allocation:
+  # Per-cycle dollar amount to deploy across all crypto assets
+  # With 12 cycles/day, $2/cycle = $24/day = ~$168/week from this sleeve
+  dollars_per_cycle: 2.00
+  min_trade_dollars: 1.00   # Alpaca minimum
+
+  # Sleeve gets 30% of total capital allocation
+  # (equity momentum gets the other 70%)
+  sleeve_pct: 0.30

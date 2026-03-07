@@ -13,7 +13,7 @@ position_limits:
   averaging_down: false             # NEVER — hard rule (same as before)
 
 daily_limits:
-  max_daily_loss: 0.05              # 5% daily — loose enough for real market moves on small $
+  max_daily_loss: 0.03              # 3% daily — tighter protection for small account
   max_weekly_drawdown: 0.10         # 10% weekly — $50 on a $500 account, not catastrophic
 
 shutdown_rules:
@@ -59,9 +59,9 @@ risk_modes:
 # Thresholds for mode transitions
 mode_transitions:
   aggressive_trigger:
-    min_rolling_return: 0.05        # 5% gain (was 8% — lower bar for small account)
-    max_drawdown: 0.06              # Drawdown under 6% (was 4% — more realistic)
-    lookback_days: 30               # 30 days (was 60 — faster reaction for small account)
+    min_rolling_return: 0.12        # 12% gain — don't scale up risk on marginal performance
+    max_drawdown: 0.06              # Drawdown under 6%
+    lookback_days: 60               # 60 days — longer window avoids noise
 
   conservative_trigger:
     max_drawdown: 0.10              # 10% drawdown (was 5% — $50 on $500 isn't scary)

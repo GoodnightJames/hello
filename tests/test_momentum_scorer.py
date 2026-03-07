@@ -146,8 +146,20 @@ class TestMinimumEdge:
 
 
 class TestRSIFilter:
-    def test_overbought_blocked(self, strategy_config):
-        """RSI(2) > 90 should block BUY."""
+    """RSI filter tests use explicit config since production config has RSI disabled."""
+
+    RSI_ENABLED_CONFIG = {
+        "signals": {
+            "rsi_filter": {
+                "enabled": True,
+                "overbought_threshold": 90,
+                "oversold_boost": 1.25,
+            }
+        }
+    }
+
+    def test_overbought_blocked(self):
+        """RSI(2) > 90 should block BUY when filter is enabled."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
             "rsi_2": pd.DataFrame(
@@ -155,11 +167,11 @@ class TestRSIFilter:
                 index=dates,
             ),
         }
-        allowed, rsi_val, mult = check_rsi_filter(features, "SPY", strategy_config)
+        allowed, rsi_val, mult = check_rsi_filter(features, "SPY", self.RSI_ENABLED_CONFIG)
         assert allowed is False
         assert rsi_val == pytest.approx(95.0)
 
-    def test_normal_rsi_passes(self, strategy_config):
+    def test_normal_rsi_passes(self):
         """RSI(2) = 50 should pass."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
@@ -168,11 +180,11 @@ class TestRSIFilter:
                 index=dates,
             ),
         }
-        allowed, rsi_val, mult = check_rsi_filter(features, "SPY", strategy_config)
+        allowed, rsi_val, mult = check_rsi_filter(features, "SPY", self.RSI_ENABLED_CONFIG)
         assert allowed is True
         assert mult == pytest.approx(1.0)
 
-    def test_oversold_gets_boost(self, strategy_config):
+    def test_oversold_gets_boost(self):
         """RSI(2) < 10 should boost signal strength."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
@@ -181,7 +193,7 @@ class TestRSIFilter:
                 index=dates,
             ),
         }
-        allowed, rsi_val, mult = check_rsi_filter(features, "SPY", strategy_config)
+        allowed, rsi_val, mult = check_rsi_filter(features, "SPY", self.RSI_ENABLED_CONFIG)
         assert allowed is True
         assert mult == pytest.approx(1.25)  # oversold boost
 
@@ -317,8 +329,25 @@ class TestScoreDualMomentum:
         spy_buys = [s for s in buy_signals if s["symbol"] == "SPY"]
         assert len(spy_buys) == 0  # Filtered out by minimum edge
 
-    def test_rsi_overbought_blocks_buy(self, strategy_config):
-        """RSI(2) > 90 should prevent BUY even with strong momentum."""
+    def test_rsi_overbought_blocks_buy_when_enabled(self):
+        """RSI(2) > 90 should prevent BUY when RSI filter is enabled."""
+        # Use explicit config with RSI enabled (production config has it disabled)
+        config = {
+            "instruments": {
+                "risk_assets": ["SPY", "QQQ"],
+                "safe_assets": ["AGG", "SHY"],
+            },
+            "signals": {
+                "benchmark": "SHY",
+                "max_buy_signals": 3,
+                "skip_recent_days": 0,
+                "multi_timeframe": {"enabled": False},
+                "min_edge_pct": 0.0,
+                "rsi_filter": {"enabled": True, "overbought_threshold": 90, "oversold_boost": 1.25},
+                "signal_strength": {"enabled": True, "weight_12m": 0.5, "weight_6m": 0.3, "weight_3m": 0.2},
+                "fast_exit": {"enabled": False},
+            },
+        }
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         returns_12m = pd.DataFrame(
             {
@@ -350,17 +379,24 @@ class TestScoreDualMomentum:
             "sma": {},
             "rsi_2": rsi_data,
         }
-        signals = score_dual_momentum(features, strategy_config)
+        signals = score_dual_momentum(features, config)
         # SPY blocked by RSI, QQQ should get the BUY instead
         buy_signals = [s for s in signals if s["signal_type"] == "BUY"]
         if buy_signals:
-            # Either QQQ gets BUY or bonds rotation
             assert buy_signals[0]["symbol"] != "SPY"
 
 
 class TestFastExit:
-    def test_exit_when_3m_below_benchmark(self, strategy_config):
-        """3-month return below benchmark triggers fast exit."""
+    """Fast exit tests use explicit config since production config has it disabled."""
+
+    FAST_EXIT_CONFIG = {
+        "signals": {
+            "fast_exit": {"enabled": True, "exit_on_3m_breakdown": True, "cooldown_days": 5}
+        }
+    }
+
+    def test_exit_when_3m_below_benchmark(self):
+        """3-month return below benchmark triggers fast exit when enabled."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
             "returns": {
@@ -370,11 +406,11 @@ class TestFastExit:
                 ),
             },
         }
-        should_exit, details = check_fast_exit(features, "SPY", "SHY", strategy_config)
+        should_exit, details = check_fast_exit(features, "SPY", "SHY", self.FAST_EXIT_CONFIG)
         assert should_exit is True
         assert details["return_3m"] < details["benchmark_3m"]
 
-    def test_no_exit_when_3m_above_benchmark(self, strategy_config):
+    def test_no_exit_when_3m_above_benchmark(self):
         """3-month return above benchmark = no exit."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
@@ -385,7 +421,7 @@ class TestFastExit:
                 ),
             },
         }
-        should_exit, details = check_fast_exit(features, "SPY", "SHY", strategy_config)
+        should_exit, details = check_fast_exit(features, "SPY", "SHY", self.FAST_EXIT_CONFIG)
         assert should_exit is False
 
     def test_disabled_never_exits(self):
@@ -599,8 +635,25 @@ class TestMultiPositionBuy:
             assert "buy_slot" in s["metadata"]
             assert s["metadata"]["buy_slot"] >= 1
 
-    def test_fast_exit_sell_in_scoring(self, strategy_config):
-        """Fast exit should emit SELL with fast_exit metadata in full pipeline."""
+    def test_fast_exit_sell_in_scoring(self):
+        """Fast exit should emit SELL with fast_exit metadata when enabled."""
+        # Use explicit config with fast exit enabled (production config has it disabled)
+        config = {
+            "instruments": {
+                "risk_assets": ["SPY", "QQQ"],
+                "safe_assets": ["AGG", "SHY", "TLT"],
+            },
+            "signals": {
+                "benchmark": "SHY",
+                "max_buy_signals": 3,
+                "skip_recent_days": 0,
+                "multi_timeframe": {"enabled": True, "require_6m_positive": True, "require_3m_positive": False},
+                "min_edge_pct": 0.02,
+                "rsi_filter": {"enabled": False},
+                "signal_strength": {"enabled": True, "weight_12m": 0.5, "weight_6m": 0.3, "weight_3m": 0.2},
+                "fast_exit": {"enabled": True, "exit_on_3m_breakdown": True, "cooldown_days": 5},
+            },
+        }
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         returns_12m = pd.DataFrame(
             {
@@ -636,7 +689,7 @@ class TestMultiPositionBuy:
             "sma": {},
             "rsi_2": pd.DataFrame(),
         }
-        signals = score_dual_momentum(features, strategy_config)
+        signals = score_dual_momentum(features, config)
         spy_signals = [s for s in signals if s["symbol"] == "SPY"]
         assert len(spy_signals) == 1
         assert spy_signals[0]["signal_type"] == "SELL"
@@ -644,8 +697,25 @@ class TestMultiPositionBuy:
 
 
 class TestDailyScan:
-    def test_exits_broken_positions(self, strategy_config):
-        """Daily scan should SELL positions with 3m breakdown."""
+    DAILY_SCAN_CONFIG = {
+        "instruments": {
+            "risk_assets": ["SPY", "QQQ", "IWM", "XLK"],
+            "safe_assets": ["AGG", "SHY", "TLT"],
+        },
+        "signals": {
+            "benchmark": "SHY",
+            "max_buy_signals": 3,
+            "skip_recent_days": 0,
+            "multi_timeframe": {"enabled": False},
+            "min_edge_pct": 0.0,
+            "rsi_filter": {"enabled": False},
+            "signal_strength": {"enabled": True, "weight_12m": 0.5, "weight_6m": 0.3, "weight_3m": 0.2},
+            "fast_exit": {"enabled": True, "exit_on_3m_breakdown": True, "cooldown_days": 5},
+        },
+    }
+
+    def test_exits_broken_positions(self):
+        """Daily scan should SELL positions with 3m breakdown when fast exit enabled."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
             "returns": {
@@ -663,13 +733,13 @@ class TestDailyScan:
                 ),
             },
         }
-        signals = run_daily_scan(features, ["SPY", "QQQ"], strategy_config)
+        signals = run_daily_scan(features, ["SPY", "QQQ"], self.DAILY_SCAN_CONFIG)
         sell_signals = [s for s in signals if s["signal_type"] == "SELL"]
         assert len(sell_signals) == 1
         assert sell_signals[0]["symbol"] == "SPY"
         assert sell_signals[0]["metadata"]["scan_type"] == "daily"
 
-    def test_no_exits_when_all_healthy(self, strategy_config):
+    def test_no_exits_when_all_healthy(self):
         """No exits when all positions are above benchmark."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
@@ -684,15 +754,15 @@ class TestDailyScan:
                 ),
             },
         }
-        signals = run_daily_scan(features, ["SPY", "QQQ"], strategy_config)
+        signals = run_daily_scan(features, ["SPY", "QQQ"], self.DAILY_SCAN_CONFIG)
         assert len(signals) == 0
 
-    def test_empty_positions_no_signals(self, strategy_config):
+    def test_empty_positions_no_signals(self):
         """No held positions = no signals."""
-        signals = run_daily_scan({}, [], strategy_config)
+        signals = run_daily_scan({}, [], self.DAILY_SCAN_CONFIG)
         assert signals == []
 
-    def test_exit_triggers_replacement_buy(self, strategy_config):
+    def test_exit_triggers_replacement_buy(self):
         """When a position exits, a replacement should be found immediately."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
@@ -730,7 +800,7 @@ class TestDailyScan:
             "sma": {},
             "rsi_2": pd.DataFrame(),
         }
-        signals = run_daily_scan(features, ["SPY", "QQQ"], strategy_config)
+        signals = run_daily_scan(features, ["SPY", "QQQ"], self.DAILY_SCAN_CONFIG)
         sell_signals = [s for s in signals if s["signal_type"] == "SELL"]
         buy_signals = [s for s in signals if s["signal_type"] == "BUY"]
         assert len(sell_signals) == 1
@@ -739,7 +809,7 @@ class TestDailyScan:
         assert buy_signals[0]["symbol"] == "XLK"
         assert buy_signals[0]["metadata"]["replacement_for"] == "SPY"
 
-    def test_no_replacement_rotates_to_bonds(self, strategy_config):
+    def test_no_replacement_rotates_to_bonds(self):
         """When no risk asset qualifies as replacement, rotate to bonds."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         features = {
@@ -767,7 +837,7 @@ class TestDailyScan:
             "sma": {},
             "rsi_2": pd.DataFrame(),
         }
-        signals = run_daily_scan(features, ["SPY"], strategy_config)
+        signals = run_daily_scan(features, ["SPY"], self.DAILY_SCAN_CONFIG)
         sell_signals = [s for s in signals if s["signal_type"] == "SELL"]
         buy_signals = [s for s in signals if s["signal_type"] == "BUY"]
         assert len(sell_signals) == 1
@@ -775,7 +845,7 @@ class TestDailyScan:
         assert buy_signals[0]["symbol"] == "AGG"
         assert "bonds" in buy_signals[0]["metadata"]["reason"].lower()
 
-    def test_cooldown_prevents_replacement_reentry(self, strategy_config):
+    def test_cooldown_prevents_replacement_reentry(self):
         """Recently exited symbols can't be picked as replacements."""
         dates = pd.date_range("2024-01-01", periods=5, freq="B")
         yesterday = pd.Timestamp.now().normalize() - pd.offsets.BDay(1)
@@ -816,7 +886,7 @@ class TestDailyScan:
         }
         # IWM was exited yesterday — should be in cooldown, skip to XLK
         exit_log = {"IWM": yesterday}
-        signals = run_daily_scan(features, ["SPY"], strategy_config, exit_log=exit_log)
+        signals = run_daily_scan(features, ["SPY"], self.DAILY_SCAN_CONFIG, exit_log=exit_log)
         buy_signals = [s for s in signals if s["signal_type"] == "BUY"]
         assert len(buy_signals) == 1
         assert buy_signals[0]["symbol"] != "IWM"  # cooldown blocks it

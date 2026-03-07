@@ -192,11 +192,11 @@ class TestSelectRiskMode:
         assert "drawdown" in result["reason"].lower()
 
     def test_aggressive_on_strong_performance(self, session, risk_params):
-        # Create equity curve: 6% gain, no drawdown (threshold is 5% for small accounts)
+        # Create equity curve: 15% gain, no drawdown (threshold is 12%)
         now = datetime.utcnow()
         start = 500
-        end = 530  # 6% gain
-        n = 35  # 30-day lookback for small accounts
+        end = 575  # 15% gain
+        n = 70  # 60-day lookback
         for i in range(n):
             equity = start + (end - start) * i / (n - 1)
             state = PortfolioState(

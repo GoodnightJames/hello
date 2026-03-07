@@ -294,7 +294,8 @@ def run_decision_engine(config_path="config/settings.yaml"):
     logger.info("=" * 50)
 
     config = load_config(config_path)
-    active_strategy = config.get("active_strategy", "momentum_v1")
+    strategies = config.get("active_strategies", {})
+    active_strategy = strategies.get("equity", config.get("active_strategy", "momentum_v1"))
 
     # Initialize DB
     init_db()

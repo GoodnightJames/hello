@@ -316,50 +316,87 @@ def run_crypto_ingestion():
         )
 
 
-def run_crypto_cycle():
+def run_crypto_dca_cycle():
     """
-    Scheduled job: full crypto pipeline — signals, decisions, execution.
+    Scheduled job: crypto DCA — buy fixed dollar amounts on schedule.
 
-    Runs 24/7, every N hours. No market calendar check.
-    Ingestion runs separately, this handles signals → decisions → immediate execution.
+    Runs 24/7, every N hours. No momentum check, no regime filter.
+    Just dollar-cost average into crypto using weighted allocation.
     """
     if check_kill_switch():
         return
 
     logger.info("=" * 40)
-    logger.info("Crypto cycle starting")
+    logger.info("Crypto DCA cycle starting")
     logger.info("=" * 40)
 
     try:
-        # Step 1: Run full decision engine (scores all assets including crypto)
-        decisions = run_decision_engine()
+        from strategies.crypto_dca_v1 import CryptoDCAStrategy
+        from data.db import get_session as get_db_session
+        from capital.manager import get_latest_portfolio_state
 
-        # Step 2: Filter to only crypto decisions
-        crypto_decisions = [d for d in decisions if "/" in d["symbol"]]
+        strategy = CryptoDCAStrategy()
 
-        if not crypto_decisions:
-            logger.info("Crypto cycle: no crypto signals — cycle complete")
+        # Check if we have enough capital for DCA
+        session = get_db_session()
+        portfolio = get_latest_portfolio_state(session)
+        session.close()
+
+        if portfolio is None:
+            logger.warning("No portfolio state — skipping crypto DCA")
             return
 
+        available_cash = portfolio.get("cash", 0)
+        total_deploy = strategy.dollars_per_cycle
+
+        if available_cash < total_deploy:
+            logger.info(
+                f"Crypto DCA: insufficient cash (${available_cash:.2f} < ${total_deploy:.2f})"
+            )
+            return
+
+        # Generate DCA buy signals (always buys, no filters)
+        signals = strategy.generate_signals()
+
+        if not signals:
+            logger.info("Crypto DCA: no signals generated")
+            return
+
+        # Convert signals directly to decisions (no regime filter for DCA)
+        decisions = []
+        for sig in signals:
+            decisions.append({
+                "symbol": sig["symbol"],
+                "action": "BUY",
+                "reason": sig["metadata"]["reason"],
+                "signal_type": "BUY",
+                "signal_id": None,
+                "position_multiplier": 1.0,
+                "signal_strength": 1.0,
+                "risk_approved": True,
+                "dca_dollar_amount": sig["metadata"]["dollar_amount"],
+            })
+
         logger.info(
-            "Crypto decisions ready",
+            "Crypto DCA decisions ready",
             extra={
                 "extra_data": {
-                    "crypto_decisions": len(crypto_decisions),
+                    "decisions": len(decisions),
+                    "total_deploy": total_deploy,
                     "summary": [
-                        {"symbol": d["symbol"], "action": d["action"]}
-                        for d in crypto_decisions
+                        {"symbol": d["symbol"], "amount": d["dca_dollar_amount"]}
+                        for d in decisions
                     ],
                 }
             },
         )
 
-        # Step 3: Execute immediately — no waiting for a separate execution job
-        results = execute_paper_decisions(crypto_decisions)
+        # Execute immediately
+        results = execute_paper_decisions(decisions)
         filled = [r for r in results if r.get("status") == "filled"]
 
         logger.info(
-            "Crypto cycle complete",
+            "Crypto DCA cycle complete",
             extra={
                 "extra_data": {
                     "filled": len(filled),
@@ -374,7 +411,7 @@ def run_crypto_cycle():
 
     except Exception as e:
         logger.error(
-            "Crypto cycle failed",
+            "Crypto DCA cycle failed",
             extra={"extra_data": {"error": str(e)}},
             exc_info=True,
         )
@@ -416,12 +453,14 @@ def main():
 
     # Load config
     config = load_config()
+    strategies = config.get("active_strategies", {})
     logger.info(
         "Config loaded",
         extra={
             "extra_data": {
-                "active_strategy": config.get("active_strategy"),
-                "universe_size": len(config["universe"]["equities"]),
+                "active_strategies": strategies,
+                "universe_equities": len(config["universe"]["equities"]),
+                "universe_crypto": len(config["universe"].get("crypto", [])),
                 "timezone": config["schedule"]["timezone"],
             }
         },
@@ -529,12 +568,12 @@ def main():
         name=f"Crypto OHLCV Data Ingestion (every {crypto_interval}h, 24/7)",
     )
 
-    # Job 7: Crypto signal + decision + execution pipeline (every N hours)
+    # Job 7: Crypto DCA pipeline (every N hours)
     scheduler.add_job(
-        run_crypto_cycle,
+        run_crypto_dca_cycle,
         trigger=IntervalTrigger(hours=crypto_interval, minutes=5),
-        id="crypto_cycle",
-        name=f"Crypto Signal + Decision + Execution (every {crypto_interval}h, 24/7)",
+        id="crypto_dca_cycle",
+        name=f"Crypto DCA Buy Cycle (every {crypto_interval}h, 24/7)",
     )
 
     jobs = [
@@ -546,7 +585,7 @@ def main():
         {"id": "eod_sync", "trigger": f"Mon-Fri at {schedule['close_sync']} {tz}"},
         {"id": "weekly_report", "trigger": f"Sunday at 10:00 {tz}"},
         {"id": "crypto_ingestion", "trigger": f"Every {crypto_interval}h (24/7)"},
-        {"id": "crypto_cycle", "trigger": f"Every {crypto_interval}h +5min (24/7)"},
+        {"id": "crypto_dca_cycle", "trigger": f"Every {crypto_interval}h +5min (24/7)"},
     ]
 
     logger.info(
@@ -556,15 +595,15 @@ def main():
 
     logger.info("Starting scheduler — press Ctrl+C to exit")
 
-    # Run first crypto cycle immediately on startup (don't wait for interval)
+    # Run first crypto DCA cycle immediately on startup (don't wait for interval)
     if crypto_run_on_startup and config["universe"].get("crypto"):
-        logger.info("Running crypto cycle on startup")
+        logger.info("Running crypto DCA cycle on startup")
         try:
             run_crypto_ingestion()
-            run_crypto_cycle()
+            run_crypto_dca_cycle()
         except Exception as e:
             logger.error(
-                "Startup crypto cycle failed (non-fatal)",
+                "Startup crypto DCA cycle failed (non-fatal)",
                 extra={"extra_data": {"error": str(e)}},
             )
 

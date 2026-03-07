@@ -571,10 +571,18 @@ def score_dual_momentum(features, strategy_config, exit_log=None):
     if exit_log is None:
         exit_log = {}
 
-    logger.info("Running dual momentum scoring (v4.0 multi-position)")
+    logger.info("Running dual momentum scoring (v5.0 multi-position)")
 
     returns = features.get("returns", {})
     returns_12m = returns.get("12m", pd.DataFrame())
+
+    # Skip-recent-month: Jegadeesh & Titman showed months 2-12 have stronger
+    # momentum signal than months 1-12. The most recent month has mean-reversion
+    # noise that dilutes the signal. Shift the return row back by skip_recent_days.
+    skip_days = strategy_config.get("signals", {}).get("skip_recent_days", 0)
+    if skip_days > 0 and len(returns_12m) > skip_days:
+        logger.info(f"Applying skip-recent-month: using returns from {skip_days} days ago")
+        returns_12m = returns_12m.iloc[:-skip_days]
 
     if returns_12m.empty:
         logger.warning("No 12-month return data — cannot score")
