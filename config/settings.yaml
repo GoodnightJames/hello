@@ -44,7 +44,14 @@ universe:
 
 # Two-sleeve architecture:
 # - Equity momentum (70%): weekly rebalance, dual momentum, regime-filtered
-# - Crypto DCA (30%): every 2 hours, dollar-cost average, no filters
+# - Crypto DCA (30%): every 8 hours, dollar-cost average, no filters
+#
+# Virtual sleeve accounting: one broker account, two internal cash ledgers.
+# Weekly deposit splits by these ratios. Each sleeve can only spend its own cash.
+sleeve_split:
+  equity: 0.70                    # 70% of deposits → equity momentum sleeve
+  crypto: 0.30                    # 30% of deposits → crypto DCA sleeve
+
 active_strategies:
   equity: momentum_v1
   crypto: crypto_dca_v1

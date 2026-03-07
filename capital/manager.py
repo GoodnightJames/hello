@@ -21,7 +21,7 @@ from datetime import datetime
 import yaml
 
 from core.logging import get_logger
-from data.db import PortfolioState, Deposit, Trade, CostBasis, get_session, init_db
+from data.db import PortfolioState, Deposit, Trade, CostBasis, SleeveBalance, get_session, init_db
 
 logger = get_logger("capital.manager")
 
@@ -264,6 +264,9 @@ def record_deposit(session, amount=None, notes=None, mode_params=None):
         new_cash = current["cash"] + amount
         current = save_portfolio_snapshot(session, new_cash, current["positions"])
 
+    # Split deposit into virtual sleeve ledgers
+    sleeve_splits = deposit_to_sleeves(session, amount)
+
     total_deposited = get_total_deposited(session)
 
     logger.info(
@@ -276,6 +279,7 @@ def record_deposit(session, amount=None, notes=None, mode_params=None):
                 "new_equity": current["total_equity"],
                 "total_deposited": total_deposited,
                 "weeks_active": session.query(Deposit).count(),
+                "sleeve_splits": sleeve_splits,
             }
         },
     )
@@ -530,3 +534,156 @@ def update_position(session, symbol, qty_change, price, current_state, buy_order
         },
     )
     return updated
+
+
+# ── Virtual Sleeve Accounting ────────────────────────────────────────────
+#
+# One broker account, two internal ledgers. Each sleeve can only spend
+# from its own virtual cash balance. Weekly $100 deposits split 70/30.
+
+SLEEVE_EQUITY = "equity"
+SLEEVE_CRYPTO = "crypto"
+
+# Default split ratios (overridden by strategy config sleeve_pct)
+DEFAULT_SLEEVE_SPLIT = {
+    SLEEVE_EQUITY: 0.70,
+    SLEEVE_CRYPTO: 0.30,
+}
+
+
+def _get_sleeve_split():
+    """Load sleeve split ratios from config, falling back to defaults."""
+    try:
+        with open("config/settings.yaml", "r") as f:
+            settings = yaml.safe_load(f)
+        sleeves = settings.get("sleeve_split", {})
+        return {
+            SLEEVE_EQUITY: sleeves.get("equity", DEFAULT_SLEEVE_SPLIT[SLEEVE_EQUITY]),
+            SLEEVE_CRYPTO: sleeves.get("crypto", DEFAULT_SLEEVE_SPLIT[SLEEVE_CRYPTO]),
+        }
+    except Exception:
+        return dict(DEFAULT_SLEEVE_SPLIT)
+
+
+def get_or_create_sleeve(session, sleeve_name):
+    """Get or create a sleeve balance record."""
+    sleeve = session.query(SleeveBalance).filter(
+        SleeveBalance.sleeve == sleeve_name
+    ).first()
+    if sleeve is None:
+        sleeve = SleeveBalance(sleeve=sleeve_name, cash=0, total_deposited=0, total_spent=0, total_received=0)
+        session.add(sleeve)
+        session.flush()
+    return sleeve
+
+
+def get_sleeve_cash(session, sleeve_name):
+    """Get available cash for a sleeve. Returns 0 if sleeve doesn't exist."""
+    sleeve = get_or_create_sleeve(session, sleeve_name)
+    return sleeve.cash
+
+
+def get_sleeve_deployable_cash(session, sleeve_name):
+    """
+    Get deployable cash for a sleeve (minus $1 buffer).
+
+    This is the sleeve-aware replacement for get_deployable_cash().
+    Each sleeve can only spend its own virtual balance.
+    """
+    cash = get_sleeve_cash(session, sleeve_name)
+    buffer = min(1.0, cash * 0.05)
+    return max(0, cash - buffer)
+
+
+def deposit_to_sleeves(session, total_amount):
+    """
+    Split a deposit across sleeves by configured ratios.
+
+    Called by record_deposit() to partition the weekly $100.
+    E.g., $100 → $70 equity + $30 crypto.
+
+    Args:
+        session: DB session.
+        total_amount: Total deposit amount.
+
+    Returns:
+        Dict of {sleeve_name: amount_deposited}.
+    """
+    split = _get_sleeve_split()
+    result = {}
+    for sleeve_name, ratio in split.items():
+        amount = round(total_amount * ratio, 2)
+        sleeve = get_or_create_sleeve(session, sleeve_name)
+        sleeve.cash += amount
+        sleeve.total_deposited += amount
+        sleeve.last_updated = datetime.utcnow()
+        result[sleeve_name] = amount
+
+    logger.info(
+        "Deposit split to sleeves",
+        extra={"extra_data": {"total": total_amount, "splits": result}},
+    )
+    return result
+
+
+def sleeve_spend(session, sleeve_name, amount):
+    """
+    Deduct cash from a sleeve after a buy fill.
+
+    Args:
+        session: DB session.
+        sleeve_name: "equity" or "crypto".
+        amount: Dollar amount spent.
+
+    Returns:
+        Remaining sleeve cash.
+    """
+    sleeve = get_or_create_sleeve(session, sleeve_name)
+    sleeve.cash -= amount
+    sleeve.total_spent += amount
+    sleeve.last_updated = datetime.utcnow()
+    logger.info(
+        f"Sleeve spend: {sleeve_name} -${amount:.2f} → ${sleeve.cash:.2f} remaining",
+    )
+    return sleeve.cash
+
+
+def sleeve_receive(session, sleeve_name, amount):
+    """
+    Credit cash to a sleeve after a sell fill.
+
+    Args:
+        session: DB session.
+        sleeve_name: "equity" or "crypto".
+        amount: Dollar amount received from sell.
+
+    Returns:
+        Updated sleeve cash.
+    """
+    sleeve = get_or_create_sleeve(session, sleeve_name)
+    sleeve.cash += amount
+    sleeve.total_received += amount
+    sleeve.last_updated = datetime.utcnow()
+    logger.info(
+        f"Sleeve receive: {sleeve_name} +${amount:.2f} → ${sleeve.cash:.2f}",
+    )
+    return sleeve.cash
+
+
+def get_sleeve_summary(session):
+    """
+    Get a summary of all sleeve balances.
+
+    Returns:
+        Dict of {sleeve_name: {cash, total_deposited, total_spent, total_received}}.
+    """
+    result = {}
+    for name in (SLEEVE_EQUITY, SLEEVE_CRYPTO):
+        sleeve = get_or_create_sleeve(session, name)
+        result[name] = {
+            "cash": sleeve.cash,
+            "total_deposited": sleeve.total_deposited,
+            "total_spent": sleeve.total_spent,
+            "total_received": sleeve.total_received,
+        }
+    return result

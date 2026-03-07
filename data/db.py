@@ -235,6 +235,26 @@ class Deposit(Base):
     __table_args__ = (Index("ix_deposits_date", "date"),)
 
 
+class SleeveBalance(Base):
+    """Virtual sleeve cash ledger.
+
+    One broker account, two internal ledgers. Each sleeve can only spend
+    from its own virtual cash balance. Weekly deposits are split 70/30.
+    """
+
+    __tablename__ = "sleeve_balances"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sleeve = Column(String(30), nullable=False, unique=True)  # "equity" or "crypto"
+    cash = Column(Float, nullable=False, default=0)
+    total_deposited = Column(Float, nullable=False, default=0)
+    total_spent = Column(Float, nullable=False, default=0)
+    total_received = Column(Float, nullable=False, default=0)  # from sells
+    last_updated = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (Index("ix_sleeve_balances_sleeve", "sleeve"),)
+
+
 def get_engine(database_url=None):
     """Create SQLAlchemy engine from config or environment."""
     if database_url is None:

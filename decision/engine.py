@@ -123,7 +123,7 @@ def apply_regime_filter(signals, regime, strategy_name, session):
 
     Rules:
     - If trend regime is risk_off AND signal is BUY on a risk asset → SKIP
-    - If trend regime is risk_off → rotate to safe asset (BUY SHY/AGG)
+    - If all equity BUYs are blocked by regime → redirect to best safe asset
     - Position multiplier applied by execution layer (stored in decision metadata)
 
     Every signal produces a decision (BUY, SELL, HOLD, or SKIP).
@@ -142,6 +142,7 @@ def apply_regime_filter(signals, regime, strategy_name, session):
     allow_entries = regime.get("allow_new_entries", True)
     multiplier = regime.get("position_multiplier", 1.0)
     trend = regime.get("trend", {})
+    equity_buys_blocked = 0  # Track how many equity BUYs regime blocked
 
     for sig in signals:
         symbol = sig["symbol"]
@@ -181,6 +182,7 @@ def apply_regime_filter(signals, regime, strategy_name, session):
                 "position_multiplier": multiplier,
                 "risk_approved": False,
             })
+            equity_buys_blocked += 1
 
             logger.info(
                 f"Decision: SKIP {symbol}",
@@ -275,6 +277,150 @@ def apply_regime_filter(signals, regime, strategy_name, session):
                 f"Decision: HOLD {symbol}",
                 extra={"extra_data": {"reason": reason, "signal_id": signal_id}},
             )
+
+    # If regime blocked equity BUYs, redirect to safe assets
+    if equity_buys_blocked > 0:
+        equity_buys_remaining = [d for d in decisions if d["action"] == "BUY" and "/" not in d["symbol"]]
+        if not equity_buys_remaining:
+            safe_decisions = _generate_safe_asset_redirect(regime, strategy_name, session, multiplier)
+            decisions.extend(safe_decisions)
+
+    # Assign equal-weight target allocations to BUY decisions (max 40% per symbol)
+    decisions = assign_target_weights(decisions)
+
+    return decisions
+
+
+# ── Regime-Off Safe-Asset Redirect ────────────────────────────────────────
+SAFE_ASSETS = ["AGG", "TLT"]  # SHY excluded — it's the benchmark
+SAFE_ASSET_STRENGTH = 0.5     # Conservative signal strength for safe assets
+
+
+def _generate_safe_asset_redirect(regime, strategy_name, session, multiplier):
+    """
+    When regime blocks all equity BUYs, redirect to the best safe asset.
+
+    Decision tree:
+    1. Get 12-month returns for AGG and TLT from feature store
+    2. Pick the one with higher 12-month return
+    3. If both have data, BUY the winner
+    4. If neither has data, hold cash (no decision emitted)
+
+    Returns:
+        List of decision dicts (0 or 1 BUY decisions).
+    """
+    trend = regime.get("trend", {})
+
+    try:
+        features = build_features(SAFE_ASSETS + ["SHY"], lookback_days=260)
+        prices = features.get("prices")
+        if prices is None or prices.empty:
+            logger.warning("Safe-asset redirect: no price data — holding cash")
+            return []
+
+        # Compute 12-month returns
+        if len(prices) < 252:
+            logger.warning("Safe-asset redirect: insufficient history — holding cash")
+            return []
+
+        returns_12m = prices.pct_change(252).iloc[-1]
+        benchmark_return = float(returns_12m.get("SHY", 0))
+
+        # Rank safe assets by 12m return
+        candidates = []
+        for sym in SAFE_ASSETS:
+            if sym in returns_12m.index:
+                ret = float(returns_12m[sym])
+                candidates.append((sym, ret))
+
+        if not candidates:
+            logger.info("Safe-asset redirect: no safe asset data — holding cash")
+            return []
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best_sym, best_ret = candidates[0]
+
+        spy_price = trend.get("spy_price")
+        spy_sma = trend.get("spy_200d_sma")
+        reason = (
+            f"BUY: Regime risk_off redirect to safe asset. "
+            f"SPY below 200d SMA ({spy_price:.2f} < {spy_sma:.2f}). "
+            f"Best safe asset: {best_sym} (12m return: {best_ret:.4f})"
+        )
+
+        signal_id = store_signal(session, strategy_name, {
+            "symbol": best_sym,
+            "signal_type": "BUY",
+            "score": best_ret,
+            "metadata": {
+                "reason": "Regime risk_off — safe asset redirect",
+                "safe_asset": True,
+                "benchmark_return": benchmark_return,
+            },
+        })
+
+        decision = store_decision(
+            session, strategy_name, best_sym,
+            action="BUY",
+            reason=reason,
+            signal_id=signal_id,
+            risk_approved=True,
+        )
+
+        logger.info(
+            f"Safe-asset redirect: BUY {best_sym}",
+            extra={"extra_data": {"reason": reason, "12m_return": best_ret}},
+        )
+
+        return [{
+            "symbol": best_sym,
+            "action": "BUY",
+            "reason": reason,
+            "signal_type": "BUY",
+            "signal_id": signal_id,
+            "position_multiplier": multiplier,
+            "signal_strength": SAFE_ASSET_STRENGTH,
+            "risk_approved": True,
+        }]
+
+    except Exception as e:
+        logger.error(
+            f"Safe-asset redirect failed — holding cash: {e}",
+            extra={"extra_data": {"error": str(e)}},
+        )
+        return []
+
+
+# ── Top-N Equal-Weight Allocation ────────────────────────────────────────
+MAX_WEIGHT_PER_POSITION = 0.40  # Hard cap: no single position > 40% of sleeve
+
+
+def assign_target_weights(decisions):
+    """
+    Assign equal-weight target_weight to BUY decisions.
+
+    For N buy decisions, each gets 1/N of sleeve capital, capped at 40%.
+    The target_weight is used by the execution layer for position sizing
+    instead of signal-strength-based sizing.
+
+    Non-BUY decisions are passed through unchanged.
+    """
+    buys = [d for d in decisions if d.get("action") == "BUY"]
+    if not buys:
+        return decisions
+
+    n = len(buys)
+    raw_weight = 1.0 / n
+    capped_weight = min(raw_weight, MAX_WEIGHT_PER_POSITION)
+
+    for d in decisions:
+        if d.get("action") == "BUY":
+            d["target_weight"] = round(capped_weight, 4)
+
+    logger.info(
+        f"Target weights assigned: {n} positions × {capped_weight:.1%} each",
+        extra={"extra_data": {"n_buys": n, "weight": capped_weight, "cap": MAX_WEIGHT_PER_POSITION}},
+    )
 
     return decisions
 
@@ -432,6 +578,9 @@ def run_daily_decision_engine(config_path="config/settings.yaml"):
 
         # Apply regime filter → produce decisions
         decisions = apply_regime_filter(signals, regime, strategy.name, session)
+
+        # Assign equal-weight allocations to any replacement BUYs
+        decisions = assign_target_weights(decisions)
 
         session.commit()
 

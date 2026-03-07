@@ -26,6 +26,11 @@ from capital.manager import (
     get_or_create_portfolio,
     update_position,
     save_portfolio_snapshot,
+    get_sleeve_deployable_cash,
+    sleeve_spend,
+    sleeve_receive,
+    SLEEVE_EQUITY,
+    SLEEVE_CRYPTO,
 )
 from risk.enforcer import load_risk_params, validate_order
 from risk.trailing_stop import update_high_water_marks, check_trailing_stops, clear_high_water
@@ -259,10 +264,16 @@ def execute_paper_decisions(decisions, config_path="config/settings.yaml"):
         session.close()
 
 
+def _classify_sleeve(symbol):
+    """Determine which sleeve a symbol belongs to."""
+    return SLEEVE_CRYPTO if "/" in symbol else SLEEVE_EQUITY
+
+
 def _execute_alpaca_buy(session, decision, portfolio, prices, risk_result):
     """Execute a BUY order via Alpaca paper trading."""
     symbol = decision["symbol"]
     multiplier = decision.get("position_multiplier", 1.0)
+    sleeve = _classify_sleeve(symbol)
 
     price = prices.get(symbol)
     if price is None or price <= 0:
@@ -274,23 +285,23 @@ def _execute_alpaca_buy(session, decision, portfolio, prices, risk_result):
             "reason": "No price data available for sizing",
         }
 
-    # Calculate allocation
-    from capital.manager import get_deployable_cash
+    # Use sleeve cash instead of shared pool
+    sleeve_cash = get_sleeve_deployable_cash(session, sleeve)
 
     # DCA decisions have a fixed dollar amount — use it directly
     dca_amount = decision.get("dca_dollar_amount")
     if dca_amount is not None:
-        allocation = min(dca_amount, get_deployable_cash(portfolio))
+        allocation = min(dca_amount, sleeve_cash)
     else:
-        # Momentum decisions: deploy available cash, scaled by signal strength.
-        # max_trade_size from risk enforcer reflects the risk mode's deployment %.
-        # Signal strength (0.1 to 2.0) scales: strong momentum = bigger position.
-        deployable = get_deployable_cash(portfolio)
-        max_trade = risk_result.get("max_trade_size", deployable)
-        signal_strength = decision.get("signal_strength", 1.0)
-        # Clamp strength between 0.5 and 1.0 for sizing (don't go below 50% or above 100% of max)
-        strength_factor = max(0.5, min(1.0, signal_strength))
-        allocation = min(deployable, max_trade) * multiplier * strength_factor
+        # Momentum decisions: deploy sleeve cash with target weights.
+        # target_weight comes from the equal-weight allocator in the decision layer.
+        target_weight = decision.get("target_weight")
+        if target_weight is not None:
+            allocation = sleeve_cash * target_weight
+        else:
+            # Fallback: old signal-strength-based sizing
+            max_trade = risk_result.get("max_trade_size", sleeve_cash)
+            allocation = min(sleeve_cash, max_trade) * multiplier
 
     shares = calculate_shares(allocation, price, fractional=True, min_notional=1.0)
     if shares <= 0:
@@ -322,9 +333,13 @@ def _execute_alpaca_buy(session, decision, portfolio, prices, risk_result):
             update_position(session, symbol, qty_change=filled_qty, price=filled_price, current_state=portfolio)
 
             total_cost = filled_qty * filled_price
+
+            # Deduct from sleeve ledger
+            sleeve_spend(session, sleeve, total_cost)
+
             logger.info(
-                f"Alpaca BUY filled: {filled_qty:.6f} {symbol} @ ${filled_price:.2f} = ${total_cost:.2f}",
-                extra={"extra_data": {"order_id": order["id"], "broker_order_id": broker_order_id}},
+                f"Alpaca BUY filled: {filled_qty:.6f} {symbol} @ ${filled_price:.2f} = ${total_cost:.2f} [{sleeve}]",
+                extra={"extra_data": {"order_id": order["id"], "broker_order_id": broker_order_id, "sleeve": sleeve}},
             )
 
             return {
@@ -336,6 +351,7 @@ def _execute_alpaca_buy(session, decision, portfolio, prices, risk_result):
                 "total_cost": total_cost,
                 "order_id": order["id"],
                 "broker_order_id": broker_order_id,
+                "sleeve": sleeve,
             }
         else:
             status_str = fill_status["status"] if fill_status else "timeout"
@@ -367,6 +383,7 @@ def _execute_alpaca_buy(session, decision, portfolio, prices, risk_result):
 def _execute_alpaca_sell(session, decision, portfolio):
     """Execute a SELL order via Alpaca paper trading."""
     symbol = decision["symbol"]
+    sleeve = _classify_sleeve(symbol)
     positions = portfolio.get("positions", {})
     current_qty = positions.get(symbol, 0)
 
@@ -401,9 +418,13 @@ def _execute_alpaca_sell(session, decision, portfolio):
             clear_high_water(session, symbol)
 
             total_proceeds = filled_qty * filled_price
+
+            # Credit proceeds back to sleeve ledger
+            sleeve_receive(session, sleeve, total_proceeds)
+
             logger.info(
-                f"Alpaca SELL filled: {filled_qty} {symbol} @ ${filled_price:.2f} = ${total_proceeds:.2f}",
-                extra={"extra_data": {"order_id": order["id"], "broker_order_id": broker_order_id}},
+                f"Alpaca SELL filled: {filled_qty} {symbol} @ ${filled_price:.2f} = ${total_proceeds:.2f} [{sleeve}]",
+                extra={"extra_data": {"order_id": order["id"], "broker_order_id": broker_order_id, "sleeve": sleeve}},
             )
 
             return {
@@ -415,6 +436,7 @@ def _execute_alpaca_sell(session, decision, portfolio):
                 "total_proceeds": total_proceeds,
                 "order_id": order["id"],
                 "broker_order_id": broker_order_id,
+                "sleeve": sleeve,
             }
         else:
             status_str = fill_status["status"] if fill_status else "timeout"

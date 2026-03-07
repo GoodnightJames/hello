@@ -333,25 +333,20 @@ def run_crypto_dca_cycle():
     try:
         from strategies.crypto_dca_v1 import CryptoDCAStrategy
         from data.db import get_session as get_db_session
-        from capital.manager import get_latest_portfolio_state
+        from capital.manager import get_sleeve_deployable_cash, SLEEVE_CRYPTO
 
         strategy = CryptoDCAStrategy()
 
-        # Check if we have enough capital for DCA
+        # Check if crypto sleeve has enough capital for DCA
         session = get_db_session()
-        portfolio = get_latest_portfolio_state(session)
+        sleeve_cash = get_sleeve_deployable_cash(session, SLEEVE_CRYPTO)
         session.close()
 
-        if portfolio is None:
-            logger.warning("No portfolio state — skipping crypto DCA")
-            return
-
-        available_cash = portfolio.get("cash", 0)
         total_deploy = strategy.dollars_per_cycle
 
-        if available_cash < total_deploy:
+        if sleeve_cash < total_deploy:
             logger.info(
-                f"Crypto DCA: insufficient cash (${available_cash:.2f} < ${total_deploy:.2f})"
+                f"Crypto DCA: insufficient sleeve cash (${sleeve_cash:.2f} < ${total_deploy:.2f})"
             )
             return
 
