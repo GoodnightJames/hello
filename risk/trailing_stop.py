@@ -80,6 +80,7 @@ def check_trailing_stops(session, positions_with_prices, risk_params):
 
     stop_pct = stop_config.get("stop_pct", 0.08)
     min_gain = stop_config.get("min_gain_to_activate", 0.03)
+    absolute_stop_pct = stop_config.get("absolute_stop_pct", 0.15)
 
     triggered = []
 
@@ -94,7 +95,28 @@ def check_trailing_stops(session, positions_with_prices, risk_params):
         if hw is None:
             continue
 
-        # Only activate trailing stop after minimum gain from entry
+        # 1. Absolute stop — unconditional floor (no arming required)
+        if hw.entry_price > 0:
+            loss_from_entry = (hw.entry_price - current_price) / hw.entry_price
+            if loss_from_entry >= absolute_stop_pct:
+                triggered.append(symbol)
+                logger.warning(
+                    f"ABSOLUTE STOP triggered: {symbol} "
+                    f"current=${current_price:.2f}, entry=${hw.entry_price:.2f} "
+                    f"(loss={loss_from_entry:.1%}, floor={absolute_stop_pct:.0%})",
+                    extra={
+                        "extra_data": {
+                            "symbol": symbol,
+                            "current_price": current_price,
+                            "entry_price": hw.entry_price,
+                            "loss_from_entry": round(loss_from_entry, 4),
+                            "stop_type": "absolute",
+                        }
+                    },
+                )
+                continue
+
+        # 2. Trailing stop — requires arming (min gain from entry)
         gain_from_entry = (hw.high_price - hw.entry_price) / hw.entry_price if hw.entry_price > 0 else 0
         if gain_from_entry < min_gain:
             continue
@@ -118,6 +140,7 @@ def check_trailing_stops(session, positions_with_prices, risk_params):
                         "entry_price": hw.entry_price,
                         "drop_from_high": round(drop_from_high, 4),
                         "gain_from_entry": round(gain_from_entry, 4),
+                        "stop_type": "trailing",
                     }
                 },
             )

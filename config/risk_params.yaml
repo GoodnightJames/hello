@@ -28,6 +28,7 @@ trailing_stop:
   enabled: true
   stop_pct: 0.08                    # Sell if price drops 8% from high-water mark
   min_gain_to_activate: 0.03        # Only activate after 3% gain from entry (let winners run first)
+  absolute_stop_pct: 0.15           # Hard floor: sell if price drops 15% from entry, regardless of arming
 
 kill_switch:
   env_var: KILL_SWITCH

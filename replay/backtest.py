@@ -107,6 +107,7 @@ def run_backtest(start_date, end_date, weekly_deposit=100.0, initial_capital=0.0
     trailing_stop_enabled = stop_config.get("enabled", True)
     stop_pct = stop_config.get("stop_pct", 0.08)
     min_gain_to_activate = stop_config.get("min_gain_to_activate", 0.03)
+    absolute_stop_pct = stop_config.get("absolute_stop_pct", 0.15)
 
     # Max per-position cap
     max_weight = 0.40
@@ -116,7 +117,7 @@ def run_backtest(start_date, end_date, weekly_deposit=100.0, initial_capital=0.0
     positions = {}  # {symbol: {"qty": float, "entry_price": float, "high_price": float}}
     equity_curve = []
     trades = []
-    exit_counts = {"rank_drop": 0, "trailing_stop": 0, "regime_redirect": 0}
+    exit_counts = {"rank_drop": 0, "trailing_stop": 0, "absolute_stop": 0, "regime_redirect": 0}
     sleeve_history = []
 
     # Get all rebalance dates (Fridays)
@@ -169,6 +170,8 @@ def run_backtest(start_date, end_date, weekly_deposit=100.0, initial_capital=0.0
                 }
 
             # Check trailing stops before rebalancing
+            # Use daily bars between last Friday and this Friday to update
+            # high-water marks and detect intra-week stop triggers
             if trailing_stop_enabled:
                 stopped_out = []
                 for sym, pos in list(positions.items()):
@@ -176,17 +179,49 @@ def run_backtest(start_date, end_date, weekly_deposit=100.0, initial_capital=0.0
                     if current_price is None:
                         continue
 
-                    # Update high-water mark
-                    if current_price > pos["high_price"]:
+                    # Update high-water mark using daily bars (not just Friday close)
+                    # This catches intra-week highs for more accurate stop tracking
+                    if sym in prices.columns:
+                        last_entry = pos.get("last_checked", pos["entry_date"])
+                        daily_prices = prices[sym].loc[
+                            (prices.index > last_entry) & (prices.index <= rebalance_date)
+                        ]
+                        if not daily_prices.empty:
+                            week_high = float(daily_prices.max())
+                            if week_high > pos["high_price"]:
+                                pos["high_price"] = week_high
+                    elif current_price > pos["high_price"]:
                         pos["high_price"] = current_price
 
+                    pos["last_checked"] = rebalance_date
+
+                    # 1. Absolute stop — unconditional floor (no arming required)
+                    loss_from_entry = (pos["entry_price"] - current_price) / pos["entry_price"]
+                    if loss_from_entry >= absolute_stop_pct:
+                        proceeds = pos["qty"] * current_price
+                        equity_sleeve_cash += proceeds
+                        pnl = (current_price - pos["entry_price"]) * pos["qty"]
+                        trades.append({
+                            "symbol": sym,
+                            "action": "SELL",
+                            "exit_path": "absolute_stop",
+                            "date": rebalance_date.isoformat()[:10],
+                            "entry_price": pos["entry_price"],
+                            "exit_price": current_price,
+                            "qty": pos["qty"],
+                            "pnl": round(pnl, 2),
+                        })
+                        exit_counts["absolute_stop"] = exit_counts.get("absolute_stop", 0) + 1
+                        stopped_out.append(sym)
+                        continue
+
+                    # 2. Trailing stop — requires arming (3% gain from entry)
                     gain_from_entry = (pos["high_price"] - pos["entry_price"]) / pos["entry_price"]
                     if gain_from_entry < min_gain_to_activate:
                         continue
 
                     stop_price = pos["high_price"] * (1 - stop_pct)
                     if current_price <= stop_price:
-                        # Trailing stop triggered
                         proceeds = pos["qty"] * current_price
                         equity_sleeve_cash += proceeds
                         pnl = (current_price - pos["entry_price"]) * pos["qty"]
@@ -266,6 +301,8 @@ def run_backtest(start_date, end_date, weekly_deposit=100.0, initial_capital=0.0
                             "qty": qty,
                             "entry_price": price,
                             "high_price": price,
+                            "entry_date": rebalance_date,
+                            "last_checked": rebalance_date,
                         }
                         trades.append({
                             "symbol": sym,
@@ -305,6 +342,8 @@ def run_backtest(start_date, end_date, weekly_deposit=100.0, initial_capital=0.0
                                 "qty": qty,
                                 "entry_price": price,
                                 "high_price": price,
+                                "entry_date": rebalance_date,
+                                "last_checked": rebalance_date,
                             }
                             trades.append({
                                 "symbol": sym,
