@@ -25,6 +25,7 @@ import yaml
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from core.logging import get_logger
 from core.market_calendar import is_market_open
@@ -315,81 +316,50 @@ def run_crypto_ingestion():
         )
 
 
-def run_crypto_signal_and_decision():
+def run_crypto_cycle():
     """
-    Scheduled job: run signal scoring and decision engine for crypto.
+    Scheduled job: full crypto pipeline — signals, decisions, execution.
 
-    Runs 24/7 — no market calendar check. Crypto never sleeps.
-    Uses the same momentum strategy but only scores crypto symbols.
+    Runs 24/7, every N hours. No market calendar check.
+    Ingestion runs separately, this handles signals → decisions → immediate execution.
     """
-    global _pending_decisions
-
     if check_kill_switch():
         return
 
-    logger.info("Running crypto signal + decision engine")
+    logger.info("=" * 40)
+    logger.info("Crypto cycle starting")
+    logger.info("=" * 40)
+
     try:
-        # Use the full decision engine — crypto symbols are in the strategy config
-        # and will be scored alongside any equity data available
+        # Step 1: Run full decision engine (scores all assets including crypto)
         decisions = run_decision_engine()
 
-        # Filter to only crypto decisions for execution
-        crypto_decisions = [
-            d for d in decisions if "/" in d["symbol"]
-        ]
+        # Step 2: Filter to only crypto decisions
+        crypto_decisions = [d for d in decisions if "/" in d["symbol"]]
 
-        if crypto_decisions:
-            _pending_decisions = crypto_decisions
-            logger.info(
-                "Crypto decision engine complete",
-                extra={
-                    "extra_data": {
-                        "total_decisions": len(decisions),
-                        "crypto_decisions": len(crypto_decisions),
-                        "summary": [
-                            {"symbol": d["symbol"], "action": d["action"]}
-                            for d in crypto_decisions
-                        ],
-                    }
-                },
-            )
-        else:
-            logger.info("Crypto decision engine: no crypto signals generated")
+        if not crypto_decisions:
+            logger.info("Crypto cycle: no crypto signals — cycle complete")
+            return
 
-    except Exception as e:
-        logger.error(
-            "Crypto decision engine failed",
-            extra={"extra_data": {"error": str(e)}},
-            exc_info=True,
+        logger.info(
+            "Crypto decisions ready",
+            extra={
+                "extra_data": {
+                    "crypto_decisions": len(crypto_decisions),
+                    "summary": [
+                        {"symbol": d["symbol"], "action": d["action"]}
+                        for d in crypto_decisions
+                    ],
+                }
+            },
         )
 
-
-def run_crypto_execution():
-    """Scheduled job: execute pending crypto decisions."""
-    global _pending_decisions
-
-    if check_kill_switch():
-        return
-
-    # Only execute crypto decisions (symbol contains "/")
-    crypto_decisions = [d for d in _pending_decisions if "/" in d["symbol"]]
-
-    if not crypto_decisions:
-        logger.info("No pending crypto decisions to execute")
-        return
-
-    logger.info(
-        "Running crypto paper execution",
-        extra={"extra_data": {"decision_count": len(crypto_decisions)}},
-    )
-    try:
+        # Step 3: Execute immediately — no waiting for a separate execution job
         results = execute_paper_decisions(crypto_decisions)
-        # Remove executed crypto decisions from pending
-        _pending_decisions = [d for d in _pending_decisions if "/" not in d["symbol"]]
-
         filled = [r for r in results if r.get("status") == "filled"]
+
         logger.info(
-            "Crypto paper execution complete",
+            "Crypto cycle complete",
             extra={
                 "extra_data": {
                     "filled": len(filled),
@@ -401,9 +371,10 @@ def run_crypto_execution():
                 }
             },
         )
+
     except Exception as e:
         logger.error(
-            "Crypto paper execution failed",
+            "Crypto cycle failed",
             extra={"extra_data": {"error": str(e)}},
             exc_info=True,
         )
@@ -546,33 +517,24 @@ def main():
         name="Weekly Performance Report",
     )
 
-    # ── Crypto Jobs (24/7 — every 6 hours, all 7 days) ──────────────────
-    crypto_ing_hours = schedule.get("crypto_ingestion_hours", "0,6,12,18")
-    crypto_sig_hours = schedule.get("crypto_signal_hours", "1,7,13,19")
-    crypto_exec_hours = schedule.get("crypto_execution_hours", "1,7,13,19")
+    # ── Crypto Jobs (24/7 — every N hours, all 7 days) ─────────────────
+    crypto_interval = int(schedule.get("crypto_interval_hours", 2))
+    crypto_run_on_startup = schedule.get("crypto_run_on_startup", True)
 
-    # Job 6: Crypto data ingestion (every 6 hours, 7 days/week)
+    # Job 6: Crypto data ingestion (every N hours, 7 days/week)
     scheduler.add_job(
         run_crypto_ingestion,
-        trigger=CronTrigger(hour=crypto_ing_hours, minute=0, timezone=tz),
+        trigger=IntervalTrigger(hours=crypto_interval),
         id="crypto_ingestion",
-        name="Crypto OHLCV Data Ingestion (24/7)",
+        name=f"Crypto OHLCV Data Ingestion (every {crypto_interval}h, 24/7)",
     )
 
-    # Job 7: Crypto signal scoring + decisions (every 6 hours, 7 days/week)
+    # Job 7: Crypto signal + decision + execution pipeline (every N hours)
     scheduler.add_job(
-        run_crypto_signal_and_decision,
-        trigger=CronTrigger(hour=crypto_sig_hours, minute=0, timezone=tz),
-        id="crypto_signal_and_decision",
-        name="Crypto Signal + Decision Engine (24/7)",
-    )
-
-    # Job 8: Crypto paper execution (every 6 hours, 7 days/week)
-    scheduler.add_job(
-        run_crypto_execution,
-        trigger=CronTrigger(hour=crypto_exec_hours, minute=30, timezone=tz),
-        id="crypto_execution",
-        name="Crypto Paper Execution (24/7)",
+        run_crypto_cycle,
+        trigger=IntervalTrigger(hours=crypto_interval, minutes=5),
+        id="crypto_cycle",
+        name=f"Crypto Signal + Decision + Execution (every {crypto_interval}h, 24/7)",
     )
 
     jobs = [
@@ -583,9 +545,8 @@ def main():
         {"id": "paper_execution", "trigger": f"Mon-Fri at {schedule['decision_engine']} {tz}"},
         {"id": "eod_sync", "trigger": f"Mon-Fri at {schedule['close_sync']} {tz}"},
         {"id": "weekly_report", "trigger": f"Sunday at 10:00 {tz}"},
-        {"id": "crypto_ingestion", "trigger": f"Every 6h at {crypto_ing_hours}:00 {tz} (24/7)"},
-        {"id": "crypto_signal_and_decision", "trigger": f"Every 6h at {crypto_sig_hours}:00 {tz} (24/7)"},
-        {"id": "crypto_execution", "trigger": f"Every 6h at {crypto_exec_hours}:30 {tz} (24/7)"},
+        {"id": "crypto_ingestion", "trigger": f"Every {crypto_interval}h (24/7)"},
+        {"id": "crypto_cycle", "trigger": f"Every {crypto_interval}h +5min (24/7)"},
     ]
 
     logger.info(
@@ -594,6 +555,18 @@ def main():
     )
 
     logger.info("Starting scheduler — press Ctrl+C to exit")
+
+    # Run first crypto cycle immediately on startup (don't wait for interval)
+    if crypto_run_on_startup and config["universe"].get("crypto"):
+        logger.info("Running crypto cycle on startup")
+        try:
+            run_crypto_ingestion()
+            run_crypto_cycle()
+        except Exception as e:
+            logger.error(
+                "Startup crypto cycle failed (non-fatal)",
+                extra={"extra_data": {"error": str(e)}},
+            )
 
     try:
         scheduler.start()

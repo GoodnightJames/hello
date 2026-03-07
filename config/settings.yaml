@@ -54,10 +54,9 @@ schedule:
   decision_engine: "09:25"
   market_open: "09:30"
   close_sync: "16:00"
-  # Crypto runs 24/7 — every 6 hours
-  crypto_ingestion_hours: "0,6,12,18"
-  crypto_signal_hours: "1,7,13,19"
-  crypto_execution_hours: "1,7,13,19"
+  # Crypto runs 24/7 — every 2 hours (12 cycles/day)
+  crypto_interval_hours: 2
+  crypto_run_on_startup: true
 
 rebalance:
   strategy_rebalance: weekly        # Rebalance weekly to align with deposits
