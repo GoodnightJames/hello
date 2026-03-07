@@ -152,11 +152,16 @@ def apply_regime_filter(signals, regime, strategy_name, session):
 
         if signal_type == "BUY" and not allow_entries:
             # Regime says no new entries — SKIP this BUY
-            reason = (
-                f"SKIP: Regime filter blocked BUY. "
-                f"SPY below 200d SMA ({trend.get('spy_price'):.2f} < {trend.get('spy_200d_sma'):.2f}). "
-                f"Holding cash."
-            ) if trend.get("spy_price") is not None else "SKIP: Regime risk_off — no new entries"
+            spy_price = trend.get("spy_price")
+            spy_sma = trend.get("spy_200d_sma")
+            if spy_price is not None and spy_sma is not None:
+                reason = (
+                    f"SKIP: Regime filter blocked BUY. "
+                    f"SPY below 200d SMA ({spy_price:.2f} < {spy_sma:.2f}). "
+                    f"Holding cash."
+                )
+            else:
+                reason = "SKIP: Regime risk_off — insufficient data for trend regime, no new entries"
 
             decision = store_decision(
                 session, strategy_name, symbol,
