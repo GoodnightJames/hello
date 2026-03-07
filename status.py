@@ -14,8 +14,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from core.logging import get_logger
-from data.db import init_db, get_session, Order, PortfolioState, RiskEvent
-from capital.manager import get_accumulation_summary
+from data.db import init_db, get_session, Order, PortfolioState, RiskEvent, PositionHighWater, CostBasis
+from capital.manager import get_accumulation_summary, get_sleeve_summary
 from execution.alpaca_broker import get_account_with_retry as get_account, get_positions_with_retry as get_positions
 
 load_dotenv()
@@ -258,6 +258,71 @@ def print_status():
             print("  (no positions)")
     except Exception as e:
         print(f"\n--- Positions ---")
+        print(f"  ERROR: {e}")
+
+    # Sleeve balances
+    try:
+        sleeves = get_sleeve_summary(session)
+        print(f"\n--- Sleeve Balances ---")
+        for name, s in sleeves.items():
+            print(f"  {name:8s}  cash: ${s['cash']:>8.2f}  "
+                  f"deposited: ${s['total_deposited']:>8.2f}  "
+                  f"spent: ${s['total_spent']:>8.2f}  "
+                  f"received: ${s['total_received']:>8.2f}")
+    except Exception as e:
+        print(f"\n--- Sleeve Balances ---")
+        print(f"  ERROR: {e}")
+
+    # Regime state
+    try:
+        from data.feature_store import build_features
+        from research.regime import classify_regime, load_risk_params as load_risk_params_regime
+        features = build_features(["SPY"], lookback_days=210)
+        if not features["prices"].empty:
+            risk_p = load_risk_params_regime()
+            regime = classify_regime(features, risk_p)
+            trend = regime.get("trend", {})
+            vol = regime.get("volatility", {})
+            spy_price = trend.get("spy_price")
+            spy_sma = trend.get("spy_200d_sma")
+            trend_regime = trend.get("trend_regime", "unknown")
+            vol_regime = vol.get("vol_regime", "unknown")
+            mult = regime.get("position_multiplier", 1.0)
+            print(f"\n--- Market Regime ---")
+            print(f"  Trend:      {trend_regime}")
+            if spy_price is not None and spy_sma is not None:
+                above_below = "above" if spy_price > spy_sma else "BELOW"
+                print(f"  SPY:        ${spy_price:.2f} ({above_below} 200d SMA ${spy_sma:.2f})")
+            print(f"  Volatility: {vol_regime}")
+            print(f"  Position multiplier: {mult:.2f}x")
+            print(f"  New entries: {'allowed' if regime.get('allow_new_entries', True) else 'BLOCKED'}")
+        else:
+            print(f"\n--- Market Regime ---")
+            print(f"  No price data available")
+    except Exception as e:
+        print(f"\n--- Market Regime ---")
+        print(f"  ERROR: {e}")
+
+    # Trailing stops
+    try:
+        stops = session.query(PositionHighWater).all()
+        if stops:
+            print(f"\n--- Trailing Stops ({len(stops)} positions) ---")
+            for hw in stops:
+                basis = session.query(CostBasis).filter(CostBasis.symbol == hw.symbol).first()
+                gain_from_entry = (hw.high_price - hw.entry_price) / hw.entry_price if hw.entry_price > 0 else 0
+                stop_price = hw.high_price * 0.92  # 8% trailing stop
+                armed = gain_from_entry >= 0.03
+                status = "ARMED" if armed else "inactive (< 3% gain)"
+                print(f"  {hw.symbol:6s}  entry: ${hw.entry_price:>8.2f}  "
+                      f"high: ${hw.high_price:>8.2f}  "
+                      f"stop: ${stop_price:>8.2f}  "
+                      f"[{status}]")
+        else:
+            print(f"\n--- Trailing Stops ---")
+            print(f"  No positions tracked")
+    except Exception as e:
+        print(f"\n--- Trailing Stops ---")
         print(f"  ERROR: {e}")
 
     # Trade stats

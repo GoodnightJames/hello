@@ -425,6 +425,109 @@ def assign_target_weights(decisions):
     return decisions
 
 
+# ── Decision Audit Trail ─────────────────────────────────────────────────
+
+
+def _get_return_for_symbol(features, symbol, timeframe):
+    """Safely extract a return value from features."""
+    ret_df = features.get("returns", {}).get(timeframe)
+    if ret_df is not None and not ret_df.empty and symbol in ret_df.columns:
+        val = ret_df.iloc[-1][symbol]
+        try:
+            return round(float(val), 6)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _emit_decision_audit(decisions, signals, regime, features, held_positions):
+    """
+    Emit a structured audit log entry for every decision in this cycle.
+
+    Each entry captures the full context needed to answer:
+    - Why did the system take this action?
+    - What were the alternatives?
+    - What was the regime state?
+
+    This is the primary debugging tool for live systems.
+    """
+    trend = regime.get("trend", {})
+    vol = regime.get("volatility", {})
+    regime_summary = {
+        "trend_regime": trend.get("trend_regime", "unknown"),
+        "spy_price": trend.get("spy_price"),
+        "spy_200d_sma": trend.get("spy_200d_sma"),
+        "vol_regime": vol.get("vol_regime", "unknown"),
+        "position_multiplier": regime.get("position_multiplier", 1.0),
+        "allow_new_entries": regime.get("allow_new_entries", True),
+    }
+
+    # Build signal lookup for cross-referencing
+    signal_by_symbol = {s["symbol"]: s for s in signals}
+
+    audit_entries = []
+    for d in decisions:
+        symbol = d["symbol"]
+        sig = signal_by_symbol.get(symbol, {})
+        is_crypto = "/" in symbol
+        sleeve = "crypto" if is_crypto else "equity"
+
+        entry = {
+            "symbol": symbol,
+            "action": d["action"],
+            "sleeve": sleeve,
+            "target_weight": d.get("target_weight"),
+            "signal_strength": d.get("signal_strength", sig.get("signal_strength")),
+            "regime": regime_summary,
+            "returns": {
+                "12m": _get_return_for_symbol(features, symbol, "12m"),
+                "6m": _get_return_for_symbol(features, symbol, "6m"),
+                "3m": _get_return_for_symbol(features, symbol, "3m"),
+                "1m": _get_return_for_symbol(features, symbol, "1m"),
+            },
+            "benchmark_returns": {
+                "12m": _get_return_for_symbol(features, "SHY", "12m"),
+                "6m": _get_return_for_symbol(features, "SHY", "6m"),
+                "3m": _get_return_for_symbol(features, "SHY", "3m"),
+            },
+            "relative_rank": sig.get("metadata", {}).get("relative_rank"),
+            "is_held": symbol in held_positions,
+            "exit_path": _classify_exit_path(d, sig),
+            "reason": d.get("reason", ""),
+        }
+        audit_entries.append(entry)
+
+    logger.info(
+        "Decision audit trail",
+        extra={"extra_data": {
+            "cycle_type": "weekly_rebalance",
+            "regime": regime_summary,
+            "held_positions": held_positions,
+            "decisions": audit_entries,
+        }},
+    )
+
+
+def _classify_exit_path(decision, signal):
+    """Classify which exit path triggered this action."""
+    action = decision.get("action")
+    if action != "SELL":
+        return None
+
+    reason = decision.get("reason", "")
+    metadata = signal.get("metadata", {})
+
+    if "TRAILING STOP" in reason:
+        return "trailing_stop"
+    if metadata.get("fast_exit"):
+        return "fast_exit_3m"
+    if "No absolute momentum" in reason or "below benchmark" in reason:
+        return "rank_drop"
+    if "momentum breakdown" in reason:
+        return "daily_scan"
+    return "unknown"
+
+
 def run_decision_engine(config_path="config/settings.yaml"):
     """
     Main decision engine pipeline.
@@ -482,6 +585,10 @@ def run_decision_engine(config_path="config/settings.yaml"):
         # Step 5: Apply regime filter → produce decisions
         logger.info("Applying regime filter to signals")
         decisions = apply_regime_filter(signals, regime, strategy.name, session)
+
+        # Step 6: Stamp full audit context onto decisions and emit audit log
+        held_positions = get_held_positions(session)
+        _emit_decision_audit(decisions, signals, regime, features, held_positions)
 
         # Commit all signals and decisions
         session.commit()
@@ -581,6 +688,9 @@ def run_daily_decision_engine(config_path="config/settings.yaml"):
 
         # Assign equal-weight allocations to any replacement BUYs
         decisions = assign_target_weights(decisions)
+
+        # Emit audit trail for daily scan too
+        _emit_decision_audit(decisions, signals, regime, features, held_positions)
 
         session.commit()
 
