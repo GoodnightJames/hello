@@ -1,24 +1,27 @@
-# Crypto DCA Strategy — v1.1.0
-# Simple dollar-cost averaging into crypto assets.
+# Crypto DCA + Exit Strategy — v2.0.0
+# Dollar-cost average into crypto, WITH active exit management.
 #
-# RATIONALE: Momentum strategies avoid falling markets (correct behavior),
-# but that means they miss bottoms. DCA accumulates during downtrends so
-# you're positioned when momentum eventually turns positive.
+# RATIONALE: DCA accumulates positions over time. Without exits, you're
+# just buying and hoping. With take-profit and trailing stops, you lock
+# in gains, recycle capital back to the sleeve, and buy again on the
+# next cycle. This turns $30/week into a capital recycling engine.
 #
-# This is a separate sleeve from equity momentum — different market,
-# different time horizon, different logic.
+# BUY LOGIC: Rotation model — each cycle buys ONE coin, rotating
+# through the list. Alpaca requires $10 minimum per crypto order.
 #
-# ROTATION MODEL (v1.1): With a $30/week crypto budget, each cycle buys
-# ONE coin rotating through the list. Alpaca requires $10 minimum per
-# crypto order, so each cycle deploys $10 when cash is available.
-# Every 8h = 3 cycles/day. Cash guard skips cycles when sleeve < $10.
+# SELL LOGIC: Every cycle checks all open crypto positions for:
+# 1. Take-profit: sell when up X% from cost basis
+# 2. Trailing stop: sell when price drops Y% from peak (after arming)
+# 3. Hard stop: sell when down Z% from entry (unconditional)
+#
+# Capital from sells goes back to the crypto sleeve for re-deployment.
 
-version: "1.1.0"
+version: "2.0.0"
 name: crypto_dca_core
 description: >
-  Dollar-cost average into crypto assets every cycle. No momentum filter,
-  no regime filter. Rotation model: each cycle buys ONE coin, cycling
-  through the list. Ensures every trade clears Alpaca's $1 minimum.
+  Dollar-cost average into crypto with active exit management.
+  Buys on rotation, sells on take-profit or trailing stop.
+  Proceeds recycle back to sleeve for re-deployment.
 
 instruments:
   # Top 3 by market cap — concentrated for small account.
@@ -37,3 +40,30 @@ allocation:
   # Sleeve gets 30% of total capital allocation
   # (equity momentum gets the other 70%)
   sleeve_pct: 0.30
+
+# ── Exit Rules ─────────────────────────────────────────────────────
+# Checked every cycle (every 8 hours) against live Alpaca positions.
+# Multiple exits can fire in the same cycle for different positions.
+exits:
+  # Take-profit: sell entire position when gain exceeds threshold
+  take_profit:
+    enabled: true
+    target_pct: 0.08         # Sell when up 8% from avg cost basis
+    # Why 8%: Crypto moves fast. 8% is achievable in days/weeks,
+    # and locking it in recycles capital. Better than holding for
+    # 50% and giving it all back in a crash.
+
+  # Trailing stop: sell when price drops from peak (protects gains)
+  trailing_stop:
+    enabled: true
+    stop_pct: 0.05           # Sell if price drops 5% from high-water mark
+    min_gain_to_activate: 0.03  # Only arm after 3% gain from entry
+    # Why 5%: Crypto is volatile — tighter than the 8% equity stop.
+    # We want to capture the move, not ride it back down.
+
+  # Hard stop: unconditional floor (no arming needed)
+  hard_stop:
+    enabled: true
+    stop_pct: 0.10           # Sell if down 10% from entry, period
+    # Why 10%: Limits max loss per position. On $10 buys, that's
+    # $1 max loss. Preserves capital for next cycle.

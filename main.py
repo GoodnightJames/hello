@@ -316,12 +316,111 @@ def run_crypto_ingestion():
         )
 
 
+def run_crypto_exit_check():
+    """
+    Check all crypto positions for exit conditions (take-profit, trailing stop, hard stop).
+
+    Runs as part of the crypto DCA cycle. Sells execute first so proceeds
+    recycle back to the sleeve before the next buy.
+
+    Returns:
+        List of execution results from any sells triggered.
+    """
+    try:
+        from strategies.crypto_dca_v1 import CryptoDCAStrategy
+        from data.db import get_session as get_db_session, CostBasis, PositionHighWater
+        from execution.alpaca_broker import get_positions_with_retry as get_alpaca_positions
+
+        strategy = CryptoDCAStrategy()
+        instruments = set(strategy.get_instruments())
+
+        # Get live positions from Alpaca
+        all_positions = get_alpaca_positions()
+        crypto_positions = {
+            sym: pos for sym, pos in all_positions.items()
+            if sym in instruments
+        }
+
+        if not crypto_positions:
+            logger.info("Crypto exit check: no crypto positions held")
+            return []
+
+        # Get cost bases and high-water marks from DB
+        session = get_db_session()
+        try:
+            cost_bases = {}
+            for sym in crypto_positions:
+                basis = session.query(CostBasis).filter(CostBasis.symbol == sym).first()
+                if basis and basis.avg_price > 0:
+                    cost_bases[sym] = {"avg_price": basis.avg_price, "qty": basis.qty}
+
+            high_water_marks = {}
+            for sym in crypto_positions:
+                hw = session.query(PositionHighWater).filter(PositionHighWater.symbol == sym).first()
+                if hw:
+                    high_water_marks[sym] = {"high_price": hw.high_price, "entry_price": hw.entry_price}
+        finally:
+            session.close()
+
+        # Generate exit signals
+        exit_signals = strategy.generate_exit_signals(crypto_positions, cost_bases, high_water_marks)
+
+        if not exit_signals:
+            return []
+
+        # Convert exit signals to decisions
+        decisions = []
+        for sig in exit_signals:
+            decisions.append({
+                "symbol": sig["symbol"],
+                "action": "SELL",
+                "reason": sig["reason"],
+                "signal_type": "SELL",
+                "signal_id": None,
+                "position_multiplier": 1.0,
+                "risk_approved": True,  # Exits always approved
+            })
+
+        logger.info(
+            f"Crypto exits: {len(decisions)} sell decision(s)",
+            extra={
+                "extra_data": {
+                    "exits": [{"symbol": d["symbol"], "reason": d["reason"]} for d in decisions],
+                }
+            },
+        )
+
+        # Execute sells
+        results = execute_paper_decisions(decisions)
+        filled = [r for r in results if r.get("status") == "filled"]
+
+        for r in filled:
+            proceeds = r.get("total_proceeds", 0)
+            logger.info(
+                f"Crypto exit filled: {r['symbol']} → ${proceeds:.2f} back to sleeve",
+            )
+
+        return results
+
+    except Exception as e:
+        logger.error(
+            "Crypto exit check failed",
+            extra={"extra_data": {"error": str(e)}},
+            exc_info=True,
+        )
+        return []
+
+
 def run_crypto_dca_cycle():
     """
-    Scheduled job: crypto DCA — buy fixed dollar amounts on schedule.
+    Scheduled job: crypto DCA cycle — exits first, then buys.
 
-    Runs 24/7, every N hours. No momentum check, no regime filter.
-    Just dollar-cost average into crypto using weighted allocation.
+    Runs 24/7, every N hours. Each cycle:
+    1. Check all crypto positions for exit conditions (take-profit, stops)
+    2. Execute any sells (proceeds recycle to sleeve)
+    3. If sleeve has enough cash, buy the next coin in rotation
+
+    This turns the crypto sleeve into a capital recycling engine.
     """
     if check_kill_switch():
         return
@@ -335,6 +434,14 @@ def run_crypto_dca_cycle():
         from data.db import get_session as get_db_session
         from capital.manager import get_sleeve_deployable_cash, SLEEVE_CRYPTO
 
+        # ── Phase 1: Check exits first ──────────────────────────────
+        # Sells recycle capital back to sleeve before we try to buy
+        exit_results = run_crypto_exit_check()
+        exit_fills = [r for r in exit_results if r.get("status") == "filled"]
+        if exit_fills:
+            logger.info(f"Crypto exits: {len(exit_fills)} position(s) sold")
+
+        # ── Phase 2: DCA buy ────────────────────────────────────────
         strategy = CryptoDCAStrategy()
 
         # Check if crypto sleeve has enough capital for DCA
@@ -348,6 +455,7 @@ def run_crypto_dca_cycle():
             logger.info(
                 f"Crypto DCA: insufficient sleeve cash (${sleeve_cash:.2f} < ${total_deploy:.2f})"
             )
+            logger.info("Crypto DCA cycle complete (exits only)")
             return
 
         # Generate DCA buy signals (always buys, no filters)
@@ -394,7 +502,8 @@ def run_crypto_dca_cycle():
             "Crypto DCA cycle complete",
             extra={
                 "extra_data": {
-                    "filled": len(filled),
+                    "exits_filled": len(exit_fills),
+                    "buys_filled": len(filled),
                     "total": len(results),
                     "results": [
                         {"symbol": r["symbol"], "action": r["action"], "status": r["status"]}
