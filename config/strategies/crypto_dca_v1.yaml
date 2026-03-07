@@ -1,4 +1,4 @@
-# Crypto DCA Strategy — v1.0.0
+# Crypto DCA Strategy — v1.1.0
 # Simple dollar-cost averaging into crypto assets.
 #
 # RATIONALE: Momentum strategies avoid falling markets (correct behavior),
@@ -7,35 +7,33 @@
 #
 # This is a separate sleeve from equity momentum — different market,
 # different time horizon, different logic.
+#
+# ROTATION MODEL (v1.1): With a $30/week crypto budget, splitting across
+# multiple coins per cycle produces sub-$1 trades (below Alpaca minimum).
+# Instead, each cycle buys ONE coin, rotating through the list.
+# Every 8h = 3 cycles/day = 21/week. Each coin gets ~7 buys/week.
+# $1.50/cycle × 21 = $31.50/week (cash-limited to actual available).
 
-version: "1.0.0"
+version: "1.1.0"
 name: crypto_dca_core
 description: >
   Dollar-cost average into crypto assets every cycle. No momentum filter,
-  no regime filter. Just buy a fixed dollar amount on schedule.
-  Market-cap weighted allocation across the crypto universe.
+  no regime filter. Rotation model: each cycle buys ONE coin, cycling
+  through the list. Ensures every trade clears Alpaca's $1 minimum.
 
 instruments:
-  # Weighted allocation — market-cap roughly proportional
-  # Weights must sum to 1.0
+  # Top 3 by market cap — concentrated for small account.
+  # With rotation, each coin gets bought every 3rd cycle (~once/day).
   assets:
-    - symbol: BTC/USD
-      weight: 0.40       # Bitcoin — dominant, most liquid
-    - symbol: ETH/USD
-      weight: 0.25       # Ethereum — #2 by market cap
-    - symbol: SOL/USD
-      weight: 0.15       # Solana — high-growth L1
-    - symbol: LINK/USD
-      weight: 0.08       # Chainlink — oracle infrastructure
-    - symbol: AVAX/USD
-      weight: 0.07       # Avalanche — L1 competitor
-    - symbol: DOT/USD
-      weight: 0.05       # Polkadot — interoperability play
+    - symbol: BTC/USD     # Bitcoin — dominant, most liquid
+    - symbol: ETH/USD     # Ethereum — #2 by market cap
+    - symbol: SOL/USD     # Solana — high-growth L1
 
 allocation:
-  # Per-cycle dollar amount to deploy across all crypto assets
-  # With 12 cycles/day, $2/cycle = $24/day = ~$168/week from this sleeve
-  dollars_per_cycle: 2.00
+  # Full cycle amount goes to ONE coin (rotation, not split)
+  # 3 cycles/day × $1.50 = $4.50/day = $31.50/week max
+  # Cash guard in run_crypto_dca_cycle limits actual spend to available cash
+  dollars_per_cycle: 1.50
   min_trade_dollars: 1.00   # Alpaca minimum
 
   # Sleeve gets 30% of total capital allocation

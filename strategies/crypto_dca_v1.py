@@ -2,12 +2,17 @@
 Crypto DCA Strategy — dollar-cost averaging into crypto assets.
 
 No momentum filter, no regime filter. Just buy a fixed dollar amount
-on schedule, weighted by market-cap allocation.
+on schedule, rotating through coins one at a time.
+
+Rotation model: each cycle buys ONE coin, cycling through the list
+using a time-based index. This ensures every trade clears the $1
+Alpaca minimum even with small weekly budgets.
 
 This is a separate sleeve from equity momentum. Different market,
 different time horizon, different logic.
 """
 
+import time
 import yaml
 from core.logging import get_logger
 from strategies.base import StrategyBase
@@ -35,50 +40,69 @@ class CryptoDCAStrategy(StrategyBase):
     def get_instruments(self):
         """Get all crypto instruments this strategy trades."""
         assets = self.config.get("instruments", {}).get("assets", [])
-        return [a["symbol"] for a in assets]
+        # Support both formats: list of dicts with "symbol" key, or plain strings
+        if assets and isinstance(assets[0], dict):
+            return [a["symbol"] for a in assets]
+        return assets
 
-    def get_weighted_assets(self):
-        """Get list of (symbol, weight) tuples."""
-        assets = self.config.get("instruments", {}).get("assets", [])
-        return [(a["symbol"], a["weight"]) for a in assets]
+    def _get_rotation_index(self):
+        """
+        Deterministic rotation index based on current time.
+
+        Uses epoch hours divided by cycle interval to produce a stable
+        index that advances each cycle. Same hour = same coin.
+        """
+        epoch_hours = int(time.time()) // 3600
+        # 8-hour cycles: index advances every 8 hours
+        cycle_number = epoch_hours // 8
+        return cycle_number
 
     def generate_signals(self, data=None, exit_log=None):
         """
-        Generate DCA buy signals for all crypto assets.
+        Generate ONE DCA buy signal per cycle via rotation.
 
-        No momentum check, no regime check. Just buy.
-        Each signal includes the dollar amount to deploy based on weight.
+        Each cycle picks the next coin in the rotation list.
+        The full dollars_per_cycle amount goes to that one coin,
+        ensuring every trade clears the $1 Alpaca minimum.
 
         Returns:
-            List of signal dicts — always BUY signals for each asset.
+            List with one signal dict (BUY for the selected coin).
         """
-        logger.info(f"Generating DCA signals for {self.name} v{self.version}")
+        instruments = self.get_instruments()
+        if not instruments:
+            logger.warning("No instruments configured for crypto DCA")
+            return []
 
-        weighted_assets = self.get_weighted_assets()
-        signals = []
+        # Pick one coin via rotation
+        rotation_idx = self._get_rotation_index()
+        coin_idx = rotation_idx % len(instruments)
+        symbol = instruments[coin_idx]
+        dollar_amount = self.dollars_per_cycle
 
-        for symbol, weight in weighted_assets:
-            dollar_amount = self.dollars_per_cycle * weight
+        logger.info(
+            f"DCA rotation: cycle #{rotation_idx} → {symbol} "
+            f"(index {coin_idx}/{len(instruments)}), ${dollar_amount:.2f}",
+        )
 
-            if dollar_amount < self.min_trade_dollars:
-                logger.info(
-                    f"DCA skip {symbol}: ${dollar_amount:.2f} below "
-                    f"${self.min_trade_dollars:.2f} minimum",
-                )
-                continue
+        if dollar_amount < self.min_trade_dollars:
+            logger.warning(
+                f"DCA skip {symbol}: ${dollar_amount:.2f} below "
+                f"${self.min_trade_dollars:.2f} minimum",
+            )
+            return []
 
-            signals.append({
-                "symbol": symbol,
-                "signal_type": "BUY",
-                "score": weight,
-                "signal_strength": 1.0,
-                "metadata": {
-                    "strategy": "crypto_dca",
-                    "weight": weight,
-                    "dollar_amount": dollar_amount,
-                    "reason": f"DCA: ${dollar_amount:.2f} ({weight:.0%} of ${self.dollars_per_cycle:.2f})",
-                },
-            })
+        signals = [{
+            "symbol": symbol,
+            "signal_type": "BUY",
+            "score": 1.0,
+            "signal_strength": 1.0,
+            "metadata": {
+                "strategy": "crypto_dca",
+                "dollar_amount": dollar_amount,
+                "rotation_index": coin_idx,
+                "reason": f"DCA rotation: ${dollar_amount:.2f} into {symbol}",
+            },
+        }]
 
         logger.info(
             "DCA signal generation complete",
@@ -86,9 +110,8 @@ class CryptoDCAStrategy(StrategyBase):
                 "extra_data": {
                     "strategy": self.name,
                     "signal_count": len(signals),
-                    "total_deploy": sum(
-                        s["metadata"]["dollar_amount"] for s in signals
-                    ),
+                    "total_deploy": dollar_amount,
+                    "rotation_coin": symbol,
                 }
             },
         )

@@ -41,9 +41,6 @@ universe:
     - BTC/USD   # Bitcoin
     - ETH/USD   # Ethereum
     - SOL/USD   # Solana
-    - AVAX/USD  # Avalanche
-    - LINK/USD  # Chainlink
-    - DOT/USD   # Polkadot
 
 # Two-sleeve architecture:
 # - Equity momentum (70%): weekly rebalance, dual momentum, regime-filtered
@@ -59,8 +56,9 @@ schedule:
   decision_engine: "09:25"
   market_open: "09:30"
   close_sync: "16:00"
-  # Crypto runs 24/7 — every 2 hours (12 cycles/day)
-  crypto_interval_hours: 2
+  # Crypto runs 24/7 — every 8 hours (3 cycles/day)
+  # Rotation model: one coin per cycle, $1.50 each = $4.50/day = $31.50/week
+  crypto_interval_hours: 8
   crypto_run_on_startup: true
 
 rebalance:
