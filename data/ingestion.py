@@ -16,6 +16,7 @@ from sqlalchemy import func
 
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
+from alpaca.data.enums import Adjustment
 from alpaca.data.timeframe import TimeFrame
 
 from core.logging import get_logger
@@ -77,6 +78,7 @@ def fetch_daily_bars(client, symbols, start_date, end_date):
             timeframe=TimeFrame.Day,
             start=start_date,
             end=end_date,
+            adjustment=Adjustment.ALL,
         )
         bars = client.get_stock_bars(request_params)
         df = bars.df
