@@ -466,9 +466,58 @@ def run_crypto_dca_cycle():
             if sym in set(strategy.get_instruments())
         }
 
+        # ── Universe filter ───────────────────────────────────────────
+        from risk.universe import filter_tradeable_universe
+        all_crypto_symbols = strategy.get_instruments()
+        try:
+            prices = get_price_history(all_crypto_symbols, lookback_days=30)
+            eligible_symbols, removed_symbols = filter_tradeable_universe(
+                all_crypto_symbols, prices
+            )
+        except Exception:
+            eligible_symbols = list(all_crypto_symbols)
+            removed_symbols = []
+
+        # ── Regime tag ────────────────────────────────────────────────
+        from risk.regime_tagger import tag_current_regime
+        try:
+            features = {"prices": get_price_history(["SPY"], lookback_days=250)}
+            regime = tag_current_regime(features)
+        except Exception:
+            regime = {"trend": "unknown", "vol": "unknown", "phase": "unknown"}
+
+        # ── Risk budget ──────────────────────────────────────────────
+        from risk.sleeve_risk import check_sleeve_risk_budget
+        from risk.enforcer import load_risk_params
+        risk_params = load_risk_params()
+        budget_result = check_sleeve_risk_budget(session, risk_params)
+        budget_scale = budget_result.get("position_scale", 1.0)
+
         # Generate buy signal — picks best coin by risk-adjusted momentum.
         # Returns empty if no coin passes both rank threshold AND cost gate.
+        scored = strategy._score_coins(eligible_symbols, held_symbols)
         signals = strategy.generate_signals(held_symbols=held_symbols)
+
+        # ── Instrument the cycle ──────────────────────────────────────
+        from review.cycle_instrumentation import instrument_crypto_cycle
+        pre_notional = total_deploy
+        post_notional = total_deploy * budget_scale
+        is_crypto_min = 10.0
+        notional_pass = post_notional >= is_crypto_min
+
+        instrument_crypto_cycle(
+            scored=scored,
+            signals=signals,
+            eligible_symbols=eligible_symbols,
+            removed_symbols=removed_symbols,
+            all_symbols=all_crypto_symbols,
+            budget_result=budget_result,
+            regime=regime,
+            pre_scale_notional=pre_notional,
+            post_scale_notional=post_notional,
+            min_notional_pass=notional_pass,
+            min_score_threshold=strategy.min_score_threshold,
+        )
 
         if not signals:
             logger.info("Crypto DCA: no signals generated (threshold or cost gate)")
