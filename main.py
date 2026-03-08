@@ -544,6 +544,33 @@ def run_crypto_dca_cycle():
             held_symbols=held_symbols, regime=regime
         )
 
+        # ── Shadow mode: score blocked symbols hypothetically ─────────
+        # Track what would have happened without policy enforcement.
+        if policy_blocked:
+            from risk.allocation_policy import record_shadow_outcome
+            blocked_syms = [s for s, _ in policy_blocked]
+            try:
+                shadow_scored = strategy._score_coins(blocked_syms, held_symbols)
+                best_live = scored[0][1] if scored else -999
+                for sym, shadow_score, _, shadow_diag in shadow_scored:
+                    # Would this blocked symbol have been selected?
+                    would_selected = (
+                        shadow_score > best_live
+                        and shadow_score >= strategy.min_score_threshold
+                        and shadow_diag.get("passes_cost_gate", False)
+                    )
+                    block_reason = dict(policy_blocked).get(sym, "")
+                    action = "disable" if "DISABLED" in block_reason else "restrict_to_regimes"
+                    record_shadow_outcome(
+                        symbol=sym,
+                        action=action,
+                        regime_phase=regime.get("phase", "unknown") if regime else "unknown",
+                        would_have_scored=shadow_score,
+                        would_have_selected=would_selected,
+                    )
+            except Exception:
+                pass  # Shadow scoring is non-critical
+
         # ── Instrument the cycle ──────────────────────────────────────
         from review.cycle_instrumentation import instrument_crypto_cycle
         pre_notional = total_deploy
