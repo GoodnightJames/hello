@@ -186,6 +186,37 @@ def instrument_crypto_cycle(
         for sym, reason in policy_blocked:
             logger.info(f"  Policy blocked: {sym} — {reason}")
 
+    # ── Mom_strength distribution stats ──────────────────────────────
+    mom_strengths = [d.get("mom_strength", 0) for _, _, _, d in scored if d]
+    edge_ratios = [d.get("edge_ratio", 0) for _, _, _, d in scored if d]
+
+    if mom_strengths:
+        ms_sorted = sorted(mom_strengths)
+        n_ms = len(ms_sorted)
+        ms_stats = {
+            "min": round(ms_sorted[0], 4),
+            "median": round(ms_sorted[n_ms // 2], 4),
+            "p75": round(ms_sorted[int(n_ms * 0.75)], 4),
+            "p90": round(ms_sorted[int(n_ms * 0.90)], 4),
+            "max": round(ms_sorted[-1], 4),
+            "pct_zero": round(sum(1 for m in ms_sorted if m == 0) / n_ms, 3),
+        }
+        logger.info(
+            f"  mom_strength dist: min={ms_stats['min']:.4f} "
+            f"med={ms_stats['median']:.4f} p75={ms_stats['p75']:.4f} "
+            f"p90={ms_stats['p90']:.4f} max={ms_stats['max']:.4f} "
+            f"zero%={ms_stats['pct_zero']:.0%}"
+        )
+    else:
+        ms_stats = {}
+
+    if edge_ratios:
+        er_by_sym = {sym: d.get("edge_ratio", 0) for sym, _, _, d in scored if d}
+        logger.info(
+            f"  edge_ratio by symbol: "
+            + " | ".join(f"{s}={r:.1f}x" for s, r in sorted(er_by_sym.items()))
+        )
+
     logger.info(
         "Cycle instrumented",
         extra={"extra_data": {
@@ -194,6 +225,7 @@ def instrument_crypto_cycle(
             "passed_threshold": passed_threshold,
             "passed_cost": passed_cost,
             "policy_blocked": len(policy_blocked) if policy_blocked else 0,
+            "mom_strength_stats": ms_stats,
         }},
     )
 
