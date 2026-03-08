@@ -74,6 +74,7 @@ def instrument_crypto_cycle(
     post_scale_notional=None,
     min_notional_pass=None,
     min_score_threshold=0.10,
+    policy_blocked=None,
 ):
     """
     Instrument one complete crypto DCA cycle.
@@ -92,6 +93,7 @@ def instrument_crypto_cycle(
         post_scale_notional: Dollar amount after budget scaling.
         min_notional_pass: Whether post-scale clears minimum.
         min_score_threshold: Score threshold for ranking gate.
+        policy_blocked: List of (symbol, reason) blocked by allocation policy.
     """
     selected_symbols = {s["symbol"] for s in signals} if signals else set()
 
@@ -180,6 +182,10 @@ def instrument_crypto_cycle(
             all_symbols=all_symbols,
         )
 
+    if policy_blocked:
+        for sym, reason in policy_blocked:
+            logger.info(f"  Policy blocked: {sym} — {reason}")
+
     logger.info(
         "Cycle instrumented",
         extra={"extra_data": {
@@ -187,6 +193,7 @@ def instrument_crypto_cycle(
             "selected": len(selected_symbols),
             "passed_threshold": passed_threshold,
             "passed_cost": passed_cost,
+            "policy_blocked": len(policy_blocked) if policy_blocked else 0,
         }},
     )
 

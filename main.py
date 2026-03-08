@@ -493,6 +493,29 @@ def run_crypto_dca_cycle():
         except Exception:
             regime = {"trend": "unknown", "vol": "unknown", "phase": "unknown"}
 
+        # ── Allocation policy ─────────────────────────────────────────
+        # Enforce symbol culling: dead_weight → disabled,
+        # conditional_earner → regime-gated, core_earner → normal.
+        # Runs AFTER universe filter, BEFORE scoring.
+        from risk.allocation_policy import refresh_and_apply
+        try:
+            eligible_symbols, policy_blocked, alloc_policy = refresh_and_apply(
+                eligible_symbols, regime=regime,
+            )
+            if policy_blocked:
+                logger.info(
+                    f"Allocation policy blocked {len(policy_blocked)} symbol(s)",
+                    extra={"extra_data": {
+                        "blocked": [(s, r) for s, r in policy_blocked],
+                    }},
+                )
+        except Exception as e:
+            logger.warning(
+                f"Allocation policy check failed (non-fatal): {e}",
+            )
+            policy_blocked = []
+            alloc_policy = {}
+
         # ── Risk budget ──────────────────────────────────────────────
         from risk.sleeve_risk import check_sleeve_risk_budget
         from risk.enforcer import load_risk_params
@@ -540,6 +563,7 @@ def run_crypto_dca_cycle():
             post_scale_notional=post_notional,
             min_notional_pass=notional_pass,
             min_score_threshold=strategy.min_score_threshold,
+            policy_blocked=policy_blocked,
         )
 
         if not signals:
