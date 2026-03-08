@@ -119,6 +119,11 @@ def build_live_policy(min_trades=None):
             sym, action, cls, prev_log,
         )
 
+        # Check re-entry: disabled symbols with improving shadow data
+        # can be promoted back to monitor for fresh evaluation
+        if action == "disable":
+            action = _check_reentry(sym, action, prev_policy)
+
         policy[sym] = {
             "action": action,
             "allowed_regimes": rule.get("allowed_regimes", ["all"]),
@@ -131,6 +136,44 @@ def build_live_policy(min_trades=None):
         }
 
     return policy
+
+
+def _check_reentry(sym, action, prev_policy):
+    """
+    Check if a disabled symbol qualifies for re-entry via shadow data.
+
+    A disabled symbol is promoted back to "monitor" if its shadow
+    performance shows it's competitive again. This prevents the
+    policy from being permanently punitive.
+
+    Re-entry requires:
+    - Previously disabled (in prior policy)
+    - Enough shadow observations (5+)
+    - Recent shadow data shows positive scores or selection
+    """
+    if action != "disable":
+        return action
+
+    # Only check re-entry for symbols that were already disabled
+    prev = prev_policy.get(sym, {})
+    if prev.get("action") != "disable":
+        return action  # Newly disabled — no re-entry yet
+
+    try:
+        from review.policy_scorecard import find_reentry_candidates
+        candidates = find_reentry_candidates()
+        reentry_syms = {c["symbol"] for c in candidates}
+
+        if sym in reentry_syms:
+            logger.info(
+                f"Re-entry: {sym} promoted from disable → monitor "
+                f"(improving shadow performance)",
+            )
+            return "monitor"
+    except Exception:
+        pass  # Non-critical — keep disabled if scorecard fails
+
+    return action
 
 
 def _apply_evidence_tiers(raw_action, classification, trade_count,
