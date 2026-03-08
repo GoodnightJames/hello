@@ -26,7 +26,7 @@ import yaml
 from core.logging import get_logger
 from strategies.base import StrategyBase
 from data.feature_store import get_price_history
-from risk.cost_model import apply_cost_penalty_to_score
+from risk.cost_model import compute_cost_hurdle, estimate_round_trip_cost
 
 logger = get_logger("strategies.crypto_dca_v1")
 
@@ -129,14 +129,22 @@ class CryptoDCAStrategy(StrategyBase):
 
     def _score_coins(self, instruments, held_symbols=None):
         """
-        Score each coin by risk-adjusted momentum with cost penalty.
+        Score each coin by risk-adjusted momentum. Separate ranking from entry gate.
 
-        Scoring formula (z-score based):
-            raw_momentum = 0.45*z(12h_ret) + 0.35*z(1d_ret) + 0.20*z(3d_ret)
-            vol_penalty  = -0.35 * z(realized_vol)
-            ext_penalty  = -0.25 * z(distance_above_ema20)
-            raw_score    = raw_momentum + vol_penalty + ext_penalty
-            adjusted     = raw_score - round_trip_cost
+        RANKING (z-score space — determines WHICH coin):
+            momentum   = 0.45*z(12h) + 0.35*z(1d) + 0.20*z(3d)
+            vol_pen    = -0.35 * z(realized_vol)
+            ext_pen    = -0.25 * z(distance_above_ema20)
+            rank_score = momentum - vol_pen - ext_pen
+            (position penalty applied multiplicatively if already held)
+
+        ENTRY GATE (return space — determines WHETHER to buy):
+            expected_edge = weighted average of raw returns (same weights)
+            cost_hurdle   = estimated round-trip cost as decimal
+            passes_cost_gate = expected_edge > cost_hurdle
+
+        This fixes the unit mismatch: z-scores rank coins against each other,
+        but the cost check uses real return vs real cost in the same units.
 
         Returns:
             List of (symbol, score, reason, diagnostics) sorted descending.
@@ -200,6 +208,7 @@ class CryptoDCAStrategy(StrategyBase):
             if symbol not in z_1d:
                 continue
 
+            # RANKING: z-score composite (dimensionless, for relative ordering)
             momentum = (
                 self.weight_12h * z_12h.get(symbol, 0)
                 + self.weight_1d * z_1d.get(symbol, 0)
@@ -207,18 +216,39 @@ class CryptoDCAStrategy(StrategyBase):
             )
             vol_pen = self.vol_penalty_weight * z_vol.get(symbol, 0)
             ext_pen = self.overextension_penalty_weight * z_ext.get(symbol, 0)
-            raw_score = momentum - vol_pen - ext_pen
+            rank_score = momentum - vol_pen - ext_pen
 
-            vol_for_cost = volatilities.get(symbol, 0.02)
-            adjusted_score, cost_info = apply_cost_penalty_to_score(
-                symbol, raw_score, volatility=vol_for_cost, notional=self.dollars_per_cycle
-            )
-
+            # Position penalty — deprioritize coins already held
             if symbol in held_symbols:
-                adjusted_score *= self.position_penalty
+                rank_score *= self.position_penalty
                 held_flag = " [HELD]"
             else:
                 held_flag = ""
+
+            # ENTRY GATE: expected edge vs cost, both in return space (decimals)
+            # Expected short-term edge = weighted average of raw returns
+            expected_edge = (
+                self.weight_12h * returns_12h.get(symbol, 0)
+                + self.weight_1d * returns_1d.get(symbol, 0)
+                + self.weight_3d * returns_3d.get(symbol, 0)
+            )
+            vol_for_cost = volatilities.get(symbol, 0.02)
+            cost_hurdle = compute_cost_hurdle(symbol, volatility=vol_for_cost)
+            passes_cost_gate = expected_edge > cost_hurdle
+
+            # ATR clamp diagnostics — check if clamps are dominating
+            atr_pct = atrs.get(symbol, 0.03)
+            tp_raw = atr_pct * self.take_profit_atr_mult
+            tp_clamped = self._clamp(tp_raw, self.take_profit_min_pct, self.take_profit_max_pct)
+            tp_was_clamped = abs(tp_raw - tp_clamped) > 1e-6
+            stop_raw = atr_pct * self.hard_stop_atr_mult
+            stop_clamped = self._clamp(stop_raw, self.hard_stop_min_pct, self.hard_stop_max_pct)
+            stop_was_clamped = abs(stop_raw - stop_clamped) > 1e-6
+
+            # Get cost breakdown for logging
+            cost_info = estimate_round_trip_cost(
+                symbol, self.dollars_per_cycle, vol_for_cost,
+            )
 
             diagnostics = {
                 "z_12h": round(z_12h.get(symbol, 0), 3),
@@ -229,29 +259,46 @@ class CryptoDCAStrategy(StrategyBase):
                 "momentum": round(momentum, 4),
                 "vol_penalty": round(vol_pen, 4),
                 "ext_penalty": round(ext_pen, 4),
-                "raw_score": round(raw_score, 4),
+                "rank_score": round(rank_score, 4),
+                "expected_edge": round(expected_edge, 6),
+                "cost_hurdle": round(cost_hurdle, 6),
+                "passes_cost_gate": passes_cost_gate,
                 "cost_bps": cost_info["total_bps"],
-                "atr_pct": round(atrs.get(symbol, 0.03), 4),
+                "atr_pct": round(atr_pct, 4),
+                "tp_raw": round(tp_raw, 4),
+                "tp_clamped": round(tp_clamped, 4),
+                "tp_was_clamped": tp_was_clamped,
+                "stop_raw": round(stop_raw, 4),
+                "stop_clamped": round(stop_clamped, 4),
+                "stop_was_clamped": stop_was_clamped,
                 "ret_1d": round(returns_1d.get(symbol, 0), 4),
                 "vol": round(volatilities.get(symbol, 0), 4),
             }
 
             reason = (
-                f"mom={momentum:+.3f} vol_pen={vol_pen:.3f} ext_pen={ext_pen:.3f} "
-                f"cost={cost_info['total_bps']:.0f}bps{held_flag}"
+                f"rank={rank_score:+.3f} edge={expected_edge:+.4f} "
+                f"hurdle={cost_hurdle:.4f} cost={cost_info['total_bps']:.0f}bps"
+                f"{' COST_FAIL' if not passes_cost_gate else ''}{held_flag}"
             )
 
-            scores.append((symbol, adjusted_score, reason, diagnostics))
+            scores.append((symbol, rank_score, reason, diagnostics))
 
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores
 
     def generate_signals(self, data=None, exit_log=None, held_symbols=None):
         """
-        Generate a buy signal ONLY if the best coin's score exceeds threshold.
+        Generate a buy signal using two independent gates:
 
-        Key change from v4: cash is a position. If no coin scores above
-        min_score_threshold after cost adjustment, we do nothing.
+        Gate 1 (ranking): z-score rank_score >= min_score_threshold
+            Ensures we only buy coins with meaningfully positive risk-adjusted momentum
+            relative to the universe. Operates in dimensionless z-score space.
+
+        Gate 2 (cost): expected_edge > cost_hurdle
+            Ensures the expected return exceeds estimated round-trip friction.
+            Both sides in decimal return space — no unit mismatch.
+
+        Both gates must pass. Cash is a position.
         """
         instruments = self.get_instruments()
         if not instruments:
@@ -267,20 +314,43 @@ class CryptoDCAStrategy(StrategyBase):
         for symbol, score, reason, diag in scored:
             logger.info(f"  Coin score: {symbol} = {score:.4f} ({reason})")
 
-        # Threshold check — no forced buys
+        # Gate 1: ranking threshold (z-score space)
         if not scored or scored[0][1] < self.min_score_threshold:
             best_sym = scored[0][0] if scored else "none"
             best_score = scored[0][1] if scored else 0.0
             logger.info(
-                f"NO BUY: Best score {best_sym}={best_score:.4f} below "
+                f"NO BUY: Best rank_score {best_sym}={best_score:.4f} below "
                 f"threshold {self.min_score_threshold}. Holding cash.",
             )
             return []
 
-        best_symbol, best_score, best_reason, best_diag = scored[0]
+        # Gate 2: cost hurdle (return space) — find best coin that passes both
+        best_entry = None
+        for symbol, score, reason, diag in scored:
+            if score < self.min_score_threshold:
+                break  # Sorted descending; all remaining below threshold
+            if diag.get("passes_cost_gate", False):
+                best_entry = (symbol, score, reason, diag)
+                break
+            else:
+                logger.info(
+                    f"COST GATE FAIL: {symbol} rank={score:.4f} but "
+                    f"edge={diag.get('expected_edge', 0):.4f} < "
+                    f"hurdle={diag.get('cost_hurdle', 0):.4f}",
+                )
+
+        if best_entry is None:
+            logger.info(
+                "NO BUY: No coin passes both rank threshold and cost hurdle. "
+                "Holding cash.",
+            )
+            return []
+
+        best_symbol, best_score, best_reason, best_diag = best_entry
 
         logger.info(
-            f"Momentum pick: {best_symbol} (score {best_score:.4f}) — {best_reason}, "
+            f"Momentum pick: {best_symbol} (rank={best_score:.4f} "
+            f"edge={best_diag.get('expected_edge', 0):.4f}) — {best_reason}, "
             f"${dollar_amount:.2f}",
         )
 
@@ -299,10 +369,12 @@ class CryptoDCAStrategy(StrategyBase):
             "metadata": {
                 "strategy": "crypto_momentum_v5",
                 "dollar_amount": dollar_amount,
-                "momentum_score": best_score,
+                "rank_score": best_score,
+                "expected_edge": best_diag.get("expected_edge", 0),
+                "cost_hurdle": best_diag.get("cost_hurdle", 0),
                 "diagnostics": best_diag,
                 "reason": f"Momentum pick: {best_reason}",
-                "threshold": self.min_score_threshold,
+                "rank_threshold": self.min_score_threshold,
             },
         }]
 
@@ -314,8 +386,10 @@ class CryptoDCAStrategy(StrategyBase):
                     "signal_count": len(signals),
                     "total_deploy": dollar_amount,
                     "selected_coin": best_symbol,
-                    "score": best_score,
-                    "threshold": self.min_score_threshold,
+                    "rank_score": best_score,
+                    "expected_edge": best_diag.get("expected_edge"),
+                    "cost_hurdle": best_diag.get("cost_hurdle"),
+                    "rank_threshold": self.min_score_threshold,
                     "all_scores": {s[0]: round(s[1], 4) for s in scored},
                 }
             },

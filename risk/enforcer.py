@@ -454,6 +454,43 @@ def validate_order(session, risk_params, decision, portfolio_state):
     # Apply risk budget scaling (reduces size when approaching limits)
     max_trade *= budget_scale
 
+    # Minimum notional floor: a budget-scaled trade that's too small to
+    # overcome friction is worse than no trade. Skip instead of placing
+    # an order that pays full fees on a meaningless position.
+    is_crypto = "/" in symbol
+    min_notional = risk_params.get("cost_model", {}).get(
+        "min_notional_after_scaling",
+        10.0 if is_crypto else 1.0,  # Alpaca crypto min $10, equity min $1
+    )
+
+    if max_trade < min_notional and budget_scale < 1.0:
+        reason = (
+            f"Trade too small after budget scaling: "
+            f"${max_trade:.2f} < ${min_notional:.2f} min "
+            f"(budget_scale={budget_scale:.2f})"
+        )
+        logger.info(
+            f"Order SKIPPED (below min notional): {action} {symbol}",
+            extra={"extra_data": {
+                "max_trade_size": max_trade,
+                "min_notional": min_notional,
+                "budget_scale": budget_scale,
+            }},
+        )
+        log_risk_event(session, "below_min_notional", "INFO", {
+            "symbol": symbol,
+            "max_trade": max_trade,
+            "min_notional": min_notional,
+            "budget_scale": budget_scale,
+        })
+        return {
+            "approved": False,
+            "reason": reason,
+            "max_trade_size": 0,
+            "risk_mode": mode,
+            "risk_checks": checks,
+        }
+
     logger.info(
         f"Order APPROVED: {action} {symbol} (mode={mode}, budget_scale={budget_scale:.2f})",
         extra={

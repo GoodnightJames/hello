@@ -466,11 +466,12 @@ def run_crypto_dca_cycle():
             if sym in set(strategy.get_instruments())
         }
 
-        # Generate buy signal — picks best coin by momentum + volatility
+        # Generate buy signal — picks best coin by risk-adjusted momentum.
+        # Returns empty if no coin passes both rank threshold AND cost gate.
         signals = strategy.generate_signals(held_symbols=held_symbols)
 
         if not signals:
-            logger.info("Crypto DCA: no signals generated")
+            logger.info("Crypto DCA: no signals generated (threshold or cost gate)")
             return
 
         # Convert signals directly to decisions (no regime filter for DCA)
