@@ -70,8 +70,8 @@ class CryptoDCAStrategy(StrategyBase):
         index that advances each cycle. Same hour = same coin.
         """
         epoch_hours = int(time.time()) // 3600
-        # 8-hour cycles: index advances every 8 hours
-        cycle_number = epoch_hours // 8
+        # 2-hour cycles: index advances every 2 hours so each buy is a different coin
+        cycle_number = epoch_hours // 2
         return cycle_number
 
     def generate_signals(self, data=None, exit_log=None):
