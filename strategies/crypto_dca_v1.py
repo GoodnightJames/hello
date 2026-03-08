@@ -1,22 +1,22 @@
 """
-Crypto DCA + Exit Strategy — v2.0
+Crypto Active Trading Strategy — v3.0
 
-Buy side: Dollar-cost average into crypto assets on a fixed schedule,
-rotating through coins one at a time.
+Buy side: Scores all coins by momentum + volatility, picks the best
+candidate that we don't already hold a large position in. Buys the
+coin most likely to hit the 5% take-profit target quickly.
 
-Sell side: Every cycle checks all open crypto positions for exit conditions:
+Sell side: Every 15 min checks all open crypto positions for exit conditions:
 1. Take-profit — sell when position is up X% from cost basis
 2. Trailing stop — sell when price drops Y% from peak (after arming)
 3. Hard stop — sell when down Z% from entry (unconditional)
 
-Proceeds from sells recycle back to the crypto sleeve for re-deployment,
-turning the weekly $30 allocation into a capital recycling engine.
+Proceeds from sells recycle back to the crypto sleeve for re-deployment.
 """
 
-import time
 import yaml
 from core.logging import get_logger
 from strategies.base import StrategyBase
+from data.feature_store import get_price_history
 
 logger = get_logger("strategies.crypto_dca_v1")
 
@@ -28,7 +28,7 @@ def load_strategy_config(config_path="config/strategies/crypto_dca_v1.yaml"):
 
 
 class CryptoDCAStrategy(StrategyBase):
-    """Crypto dollar-cost averaging strategy with active exit management."""
+    """Crypto active trading strategy with momentum-based selection and exits."""
 
     def __init__(self, config=None):
         if config is None:
@@ -62,73 +62,156 @@ class CryptoDCAStrategy(StrategyBase):
             return [a["symbol"] for a in assets]
         return assets
 
-    def _get_rotation_index(self):
+    def _score_coins(self, instruments, held_symbols=None):
         """
-        Deterministic rotation index based on current time.
+        Score each coin by momentum + volatility to find the best buy.
 
-        Uses epoch hours divided by cycle interval to produce a stable
-        index that advances each cycle. Same hour = same coin.
-        """
-        epoch_hours = int(time.time()) // 3600
-        # 2-hour cycles: index advances every 2 hours so each buy is a different coin
-        cycle_number = epoch_hours // 2
-        return cycle_number
-
-    def generate_signals(self, data=None, exit_log=None):
-        """
-        Generate ONE DCA buy signal per cycle via rotation.
-
-        Each cycle picks the next coin in the rotation list.
-        The full dollars_per_cycle amount goes to that one coin,
-        ensuring every trade clears the $10 Alpaca minimum.
+        Scoring factors:
+        1. Short-term momentum (1-day return) — coins moving up are more likely
+           to continue and hit take-profit
+        2. Volatility (avg daily range over 3 days) — higher volatility = faster
+           moves = more likely to hit 5% target
+        3. Position penalty — deprioritize coins we already hold to spread risk
 
         Returns:
-            List with one signal dict (BUY for the selected coin).
+            List of (symbol, score, reason) sorted by score descending.
+        """
+        if held_symbols is None:
+            held_symbols = set()
+
+        # Fetch recent price data (7 days is enough for our signals)
+        prices = get_price_history(instruments, lookback_days=7)
+
+        scores = []
+        for symbol in instruments:
+            if symbol not in prices.columns:
+                # No price data — can still buy via live quote, give neutral score
+                score = 0.5
+                reason = "no history (neutral)"
+                # But penalize if already held
+                if symbol in held_symbols:
+                    score *= 0.3
+                    reason += ", already held"
+                scores.append((symbol, score, reason))
+                continue
+
+            col = prices[symbol].dropna()
+            if len(col) < 2:
+                score = 0.5
+                reason = "insufficient history (neutral)"
+                if symbol in held_symbols:
+                    score *= 0.3
+                    reason += ", already held"
+                scores.append((symbol, score, reason))
+                continue
+
+            # 1-day return (momentum)
+            ret_1d = (col.iloc[-1] - col.iloc[-2]) / col.iloc[-2]
+
+            # 3-day return if available
+            if len(col) >= 4:
+                ret_3d = (col.iloc[-1] - col.iloc[-4]) / col.iloc[-4]
+            else:
+                ret_3d = ret_1d
+
+            # Volatility: average daily percentage range over last 3 days
+            # Use price swings as a proxy (close-to-close absolute changes)
+            recent = col.tail(4)
+            daily_changes = recent.pct_change().dropna().abs()
+            avg_volatility = daily_changes.mean() if len(daily_changes) > 0 else 0.02
+
+            # Score = momentum component + volatility component
+            # Positive momentum is good (coin is moving up)
+            # High volatility is good (coin moves enough to hit 5% target)
+            momentum_score = ret_1d * 2.0 + ret_3d * 1.0  # weight recent more
+            volatility_score = avg_volatility * 10.0  # scale up: 5% daily vol = 0.5
+
+            score = momentum_score + volatility_score
+
+            # Penalize coins we already hold — spread the bets
+            if symbol in held_symbols:
+                score *= 0.3
+                reason = (
+                    f"1d:{ret_1d:+.1%} 3d:{ret_3d:+.1%} vol:{avg_volatility:.1%} "
+                    f"[HELD, penalized]"
+                )
+            else:
+                reason = f"1d:{ret_1d:+.1%} 3d:{ret_3d:+.1%} vol:{avg_volatility:.1%}"
+
+            scores.append((symbol, score, reason))
+
+        # Sort by score descending — best candidate first
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores
+
+    def generate_signals(self, data=None, exit_log=None, held_symbols=None):
+        """
+        Generate ONE buy signal for the highest-scoring coin.
+
+        Instead of blind rotation, scores all coins by momentum + volatility
+        and picks the one most likely to hit the 5% take-profit target.
+        Deprioritizes coins we already hold to spread risk.
+
+        Args:
+            data: Unused (kept for interface compatibility).
+            exit_log: Unused.
+            held_symbols: Set of symbols we currently hold positions in.
+
+        Returns:
+            List with one signal dict (BUY for the best-scoring coin).
         """
         instruments = self.get_instruments()
         if not instruments:
-            logger.warning("No instruments configured for crypto DCA")
+            logger.warning("No instruments configured for crypto strategy")
             return []
 
-        # Pick one coin via rotation
-        rotation_idx = self._get_rotation_index()
-        coin_idx = rotation_idx % len(instruments)
-        symbol = instruments[coin_idx]
+        if held_symbols is None:
+            held_symbols = set()
+
+        # Score all coins and pick the best one
+        scored = self._score_coins(instruments, held_symbols)
         dollar_amount = self.dollars_per_cycle
 
+        # Log all scores for transparency
+        for symbol, score, reason in scored:
+            logger.info(f"  Coin score: {symbol} = {score:.3f} ({reason})")
+
+        best_symbol, best_score, best_reason = scored[0]
+
         logger.info(
-            f"DCA rotation: cycle #{rotation_idx} → {symbol} "
-            f"(index {coin_idx}/{len(instruments)}), ${dollar_amount:.2f}",
+            f"Momentum pick: {best_symbol} (score {best_score:.3f}) — {best_reason}, "
+            f"${dollar_amount:.2f}",
         )
 
         if dollar_amount < self.min_trade_dollars:
             logger.warning(
-                f"DCA skip {symbol}: ${dollar_amount:.2f} below "
+                f"Skip {best_symbol}: ${dollar_amount:.2f} below "
                 f"${self.min_trade_dollars:.2f} minimum",
             )
             return []
 
         signals = [{
-            "symbol": symbol,
+            "symbol": best_symbol,
             "signal_type": "BUY",
-            "score": 1.0,
-            "signal_strength": 1.0,
+            "score": best_score,
+            "signal_strength": max(0.0, min(1.0, best_score)),
             "metadata": {
-                "strategy": "crypto_dca",
+                "strategy": "crypto_momentum",
                 "dollar_amount": dollar_amount,
-                "rotation_index": coin_idx,
-                "reason": f"DCA rotation: ${dollar_amount:.2f} into {symbol}",
+                "momentum_score": best_score,
+                "reason": f"Momentum pick: {best_reason}",
             },
         }]
 
         logger.info(
-            "DCA signal generation complete",
+            "Signal generation complete",
             extra={
                 "extra_data": {
                     "strategy": self.name,
                     "signal_count": len(signals),
                     "total_deploy": dollar_amount,
-                    "rotation_coin": symbol,
+                    "selected_coin": best_symbol,
+                    "score": best_score,
                 }
             },
         )
@@ -267,8 +350,6 @@ class CryptoDCAStrategy(StrategyBase):
 
     def get_position_size(self, signal, portfolio_state):
         """
-        Position size for DCA is the fixed dollar amount from the signal.
-
-        Not percentage-based — just the flat dollar amount per cycle.
+        Position size is the fixed dollar amount from the signal.
         """
         return signal.get("metadata", {}).get("dollar_amount", self.min_trade_dollars)

@@ -441,10 +441,11 @@ def run_crypto_dca_cycle():
         if exit_fills:
             logger.info(f"Crypto exits: {len(exit_fills)} position(s) sold")
 
-        # ── Phase 2: DCA buy ────────────────────────────────────────
+        # ── Phase 2: Momentum buy ─────────────────────────────────
         strategy = CryptoDCAStrategy()
+        from execution.alpaca_broker import get_positions_with_retry as get_alpaca_positions
 
-        # Check if crypto sleeve has enough capital for DCA
+        # Check if crypto sleeve has enough capital
         session = get_db_session()
         sleeve_cash = get_sleeve_deployable_cash(session, SLEEVE_CRYPTO)
         session.close()
@@ -458,8 +459,15 @@ def run_crypto_dca_cycle():
             logger.info("Crypto DCA cycle complete (exits only)")
             return
 
-        # Generate DCA buy signals (always buys, no filters)
-        signals = strategy.generate_signals()
+        # Get currently held symbols so the strategy can deprioritize them
+        all_positions = get_alpaca_positions()
+        held_symbols = {
+            sym for sym in all_positions
+            if sym in set(strategy.get_instruments())
+        }
+
+        # Generate buy signal — picks best coin by momentum + volatility
+        signals = strategy.generate_signals(held_symbols=held_symbols)
 
         if not signals:
             logger.info("Crypto DCA: no signals generated")

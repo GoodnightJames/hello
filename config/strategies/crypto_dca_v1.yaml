@@ -1,34 +1,35 @@
-# Crypto Active Trading Strategy — v3.0.0
-# Aggressive rotation through volatile altcoins with fast exits.
+# Crypto Active Trading Strategy — v4.0.0
+# Momentum-based coin selection with fast exits.
 #
-# PHILOSOPHY: Small positions ($10), many coins, fast cycling.
-# Buy via rotation, check exits every 15 minutes, take profit at 5%.
-# Capital recycles back to the sleeve immediately for re-deployment.
-# More coins = more volatility = more take-profit triggers = compounding.
+# PHILOSOPHY: Buy the coin moving hardest RIGHT NOW. Not a blind rotation —
+# the engine scores all 10 coins by momentum + volatility every cycle and
+# picks the one most likely to hit 5% take-profit quickly.
 #
-# BUY LOGIC: Rotation through 10 coins. Each cycle buys ONE coin.
-# With 2-hour buy cycles, each coin gets bought every 20 hours.
+# BUY LOGIC: Every 2 hours, score all coins:
+#   - 1-day return (recent momentum — is it moving up?)
+#   - 3-day return (short-term trend)
+#   - Daily volatility (big swings = faster path to 5%)
+#   - Position penalty (deprioritize coins already held — spread risk)
+#   → Buy the highest-scoring coin for $10
 #
-# SELL LOGIC: Checked every 15 MINUTES (not every buy cycle):
+# SELL LOGIC: Checked every 15 MINUTES:
 # 1. Take-profit at 5% — fast capture, recycle capital
 # 2. Trailing stop at 4% from peak — protect gains
 # 3. Hard stop at 7% loss — cut losers fast
 #
-# MATH: If a coin moves 5% in 24h (common for alts), and we check
-# every 15 min, we catch it within ~15 min of hitting target.
-# $10 × 5% = $0.50 profit. Recycle $10.50, buy again.
-# If this happens 3x/week across 10 coins = $1.50/week compounding.
+# MATH: If DOGE is up 3% today with 6% daily volatility, it scores higher
+# than BTC which is flat with 1% volatility. We buy the mover, not the sleeper.
 
-version: "3.0.0"
+version: "4.0.0"
 name: crypto_active
 description: >
-  Aggressive crypto rotation with fast exits. Buys via rotation
-  across 10 volatile coins, checks exits every 15 minutes.
-  Take profit at 5%, recycle capital immediately.
+  Momentum-based crypto trading. Scores all coins by recent momentum
+  and volatility, buys the best candidate each cycle. Checks exits
+  every 15 minutes. Take profit at 5%, recycle capital immediately.
 
 instruments:
   # Mix of large-cap and high-volatility altcoins.
-  # More coins = more chances for one to hit take-profit.
+  # More coins = more chances for one to be moving hard.
   assets:
     - symbol: BTC/USD     # Bitcoin — baseline, most liquid
     - symbol: ETH/USD     # Ethereum — #2 by market cap
@@ -42,8 +43,7 @@ instruments:
     - symbol: XRP/USD     # Ripple — news-driven volatility
 
 allocation:
-  # $10 per buy cycle, rotating through 10 coins
-  # Buys happen every 2 hours (not every 15 min — need to spread capital)
+  # $10 per buy cycle — goes to the highest-scoring coin
   dollars_per_cycle: 10.00
   min_trade_dollars: 10.00  # Alpaca crypto minimum order size
 
@@ -51,24 +51,17 @@ allocation:
   sleeve_pct: 0.30
 
 # ── Exit Rules ─────────────────────────────────────────────────────
-# Checked every 15 MINUTES — this is the key speed advantage.
-# Fast checks catch short-term moves that 8-hour checks miss entirely.
+# Checked every 15 MINUTES — fast checks catch short-term moves.
 exits:
   take_profit:
     enabled: true
     target_pct: 0.05         # 5% — fast capture, recycle capital
-    # Why 5%: Altcoins regularly move 5-10% in a day. Catching 5%
-    # and recycling beats waiting for 8% and missing it.
 
   trailing_stop:
     enabled: true
     stop_pct: 0.04           # 4% drop from peak triggers sell
     min_gain_to_activate: 0.02  # Arm after just 2% gain
-    # Why 4%: Tighter than before — we want to protect small gains.
-    # If a coin runs up 6% then drops 4%, we still lock in ~2%.
 
   hard_stop:
     enabled: true
     stop_pct: 0.07           # 7% loss = cut it, move on
-    # Why 7%: On $10, that's $0.70 max loss. Fast exit preserves
-    # capital for the next rotation buy.
