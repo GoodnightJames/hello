@@ -431,17 +431,38 @@ def validate_order(session, risk_params, decision, portfolio_state):
             "risk_checks": checks,
         }
 
+    # Check 6: Sleeve-level risk budgets (drawdown, vol, turnover)
+    from risk.sleeve_risk import check_sleeve_risk_budget
+    budget_result = check_sleeve_risk_budget(session, risk_params)
+    checks["risk_budget"] = budget_result["within_budget"]
+    budget_scale = budget_result["position_scale"]
+
+    if not budget_result["within_budget"]:
+        warnings_str = "; ".join(budget_result["warnings"])
+        return {
+            "approved": False,
+            "reason": f"Risk budget exceeded: {warnings_str}",
+            "max_trade_size": 0,
+            "risk_mode": mode,
+            "risk_checks": checks,
+        }
+
     # All checks passed — size uses mode-adjusted deployment percentage
     cash = portfolio_state.get("cash", 0)
     max_trade = calculate_max_trade_size(risk_params, total_equity, mode_params=mode_params, cash=cash)
 
+    # Apply risk budget scaling (reduces size when approaching limits)
+    max_trade *= budget_scale
+
     logger.info(
-        f"Order APPROVED: {action} {symbol} (mode={mode})",
+        f"Order APPROVED: {action} {symbol} (mode={mode}, budget_scale={budget_scale:.2f})",
         extra={
             "extra_data": {
                 "max_trade_size": max_trade,
                 "risk_mode": mode,
                 "risk_checks": checks,
+                "budget_scale": budget_scale,
+                "budget_warnings": budget_result["warnings"],
             }
         },
     )
@@ -452,4 +473,5 @@ def validate_order(session, risk_params, decision, portfolio_state):
         "max_trade_size": max_trade,
         "risk_mode": mode,
         "risk_checks": checks,
+        "budget_scale": budget_scale,
     }

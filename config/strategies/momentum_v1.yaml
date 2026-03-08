@@ -70,6 +70,11 @@ signals:
   # Multi-position: hold top 3 qualified assets simultaneously
   max_buy_signals: 3
 
+  # Correlation-aware selection: max picks from any single equity cluster.
+  # Prevents "3 flavors of the same bet" (e.g., SPY + QQQ + XLK).
+  # Clusters: us_growth, us_defensive, us_cyclical, international, real_assets
+  max_per_cluster: 1
+
   # Fast exit DISABLED — let momentum run on its natural 12-month cycle
   # The 6-month confirmation filter already prevents late entries
   fast_exit:

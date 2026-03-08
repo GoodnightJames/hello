@@ -80,6 +80,35 @@ trade_throttle:
 # ─── Go-Live Criteria ─────────────────────────────────────────────────────
 # Adjusted for accumulation account reality.
 # Paper trading still proves the system works, but with realistic small $.
+# ─── Sleeve-Level Risk Budgets ──────────────────────────────────────────
+# Portfolio-behavior-based controls that supplement blunt circuit breakers.
+# These track actual portfolio risk metrics instead of trade counts.
+risk_budgets:
+  portfolio:
+    max_drawdown: 0.15            # 15% max drawdown from peak → scale down
+    max_realized_vol: 0.25        # 25% annualized vol → reduce position sizes
+    max_weekly_turnover: 2.0      # 2x NAV traded per week → slow down
+
+  equity_sleeve:
+    target_vol: 0.12              # 12% target annualized vol
+    max_drawdown: 0.12            # 12% max sleeve drawdown
+
+  crypto_sleeve:
+    target_vol: 0.25              # 25% target annualized vol
+    max_drawdown: 0.20            # 20% max sleeve drawdown
+
+# ─── Transaction Cost Model ────────────────────────────────────────────
+cost_model:
+  crypto:
+    fee_bps: 15.0                 # Alpaca crypto ~0.15%
+    base_spread_bps: 10.0
+    slippage_per_vol_bps: 5.0
+  equity:
+    fee_bps: 0.0                  # Alpaca zero commission
+    base_spread_bps: 2.0
+    slippage_per_vol_bps: 1.0
+
+# ─── Go-Live Criteria ─────────────────────────────────────────────────────
 go_live_criteria:
   min_days_trading: 21              # 3 weeks (was 30 — you're putting in real $ weekly)
   min_trades: 6                     # 6 trades (was 10 — fewer with small account)

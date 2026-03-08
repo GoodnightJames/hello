@@ -38,16 +38,17 @@ universe:
     - VNQ   # REIT
     - HYG   # High Yield Corporate Bond
   crypto:
-    - BTC/USD   # Bitcoin — baseline
-    - ETH/USD   # Ethereum — #2
-    - SOL/USD   # Solana — volatile L1
-    - DOGE/USD  # Dogecoin — meme, very volatile
-    - AVAX/USD  # Avalanche — volatile L1
-    - LINK/USD  # Chainlink — swings hard
-    - DOT/USD   # Polkadot — volatile mid-cap
-    - SHIB/USD  # Shiba Inu — huge swings
-    - PEPE/USD  # Pepe — extreme volatility
-    - XRP/USD   # Ripple — news-driven
+    # Core tier — liquid, established, reasonable spreads
+    - BTC/USD   # Bitcoin — most liquid
+    - ETH/USD   # Ethereum — #2 by cap
+    - SOL/USD   # Solana — high-cap L1
+    - XRP/USD   # Ripple — high liquidity
+    - LINK/USD  # Chainlink — oracle infrastructure
+    - AVAX/USD  # Avalanche — L1 with decent liquidity
+    - DOT/USD   # Polkadot — cross-chain
+    # Speculative tier — meme/high-vol, smaller allocation
+    - DOGE/USD  # Dogecoin — meme but liquid
+    # REMOVED: SHIB/USD, PEPE/USD — extreme spreads, poor cost-adjusted edge
 
 # Two-sleeve architecture:
 # - Equity momentum (70%): weekly rebalance, dual momentum, regime-filtered

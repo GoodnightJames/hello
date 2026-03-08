@@ -19,6 +19,7 @@ v4.0 optimizations:
 
 import pandas as pd
 from core.logging import get_logger
+from risk.correlation import filter_correlated_picks, get_cluster
 
 logger = get_logger("research.momentum_scorer")
 
@@ -652,6 +653,22 @@ def score_dual_momentum(features, strategy_config, exit_log=None):
     abs_momentum = compute_absolute_momentum(returns_12m, benchmark)
     risk_available = [s for s in risk_assets if s in returns_12m.columns]
     relative_ranking = compute_relative_momentum(returns_12m, risk_available)
+
+    # Apply correlation-aware filtering to prevent cluster concentration.
+    # This removes picks that would over-concentrate in one equity cluster
+    # (e.g., SPY + QQQ + XLK are all "US Growth" — max 1 per cluster).
+    max_per_cluster = strategy_config.get("signals", {}).get("max_per_cluster", 1)
+    relative_ranking = filter_correlated_picks(
+        relative_ranking,
+        max_per_cluster=max_per_cluster,
+    )
+    logger.info(
+        f"Post-correlation filter: {len(relative_ranking)} candidates remain",
+        extra={"extra_data": {
+            "max_per_cluster": max_per_cluster,
+            "candidates": [(s, round(r, 4)) for s, r in relative_ranking[:10]],
+        }},
+    )
 
     latest_returns = returns_12m.iloc[-1]
     benchmark_return = float(latest_returns.get(benchmark, 0))

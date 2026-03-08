@@ -1,67 +1,96 @@
-# Crypto Active Trading Strategy — v4.0.0
-# Momentum-based coin selection with fast exits.
+# Crypto Active Trading Strategy — v5.0.0
+# Risk-adjusted momentum with cost-aware scoring and ATR-scaled exits.
 #
-# PHILOSOPHY: Buy the coin moving hardest RIGHT NOW. Not a blind rotation —
-# the engine scores all 10 coins by momentum + volatility every cycle and
-# picks the one most likely to hit 5% take-profit quickly.
+# CHANGES FROM v4:
+# 1. Z-score momentum scoring replaces raw return + vol weighting
+# 2. Volatility PENALTY (not bonus) — stops overpaying for noise
+# 3. Overextension penalty — avoids chasing the most extended candle
+# 4. Cost adjustment — subtracts estimated round-trip fees from score
+# 5. Signal threshold — NO FORCED BUYS. Cash is a position.
+# 6. ATR-scaled exits — adapts to each coin's actual volatility
+# 7. Cleaner universe — core + speculative tiers
 #
-# BUY LOGIC: Every 2 hours, score all coins:
-#   - 1-day return (recent momentum — is it moving up?)
-#   - 3-day return (short-term trend)
-#   - Daily volatility (big swings = faster path to 5%)
-#   - Position penalty (deprioritize coins already held — spread risk)
-#   → Buy the highest-scoring coin for $10
-#
-# SELL LOGIC: Checked every 15 MINUTES:
-# 1. Take-profit at 5% — fast capture, recycle capital
-# 2. Trailing stop at 4% from peak — protect gains
-# 3. Hard stop at 7% loss — cut losers fast
-#
-# MATH: If DOGE is up 3% today with 6% daily volatility, it scores higher
-# than BTC which is flat with 1% volatility. We buy the mover, not the sleeper.
+# SCORING FORMULA:
+#   momentum   = 0.45*z(12h) + 0.35*z(1d) + 0.20*z(3d)
+#   penalties  = -0.35*z(realized_vol) - 0.25*z(dist_above_ema20)
+#   raw_score  = momentum + penalties
+#   final      = raw_score - round_trip_cost_estimate
+#   → Buy ONLY if final > threshold (0.10)
 
-version: "4.0.0"
+version: "5.0.0"
 name: crypto_active
 description: >
-  Momentum-based crypto trading. Scores all coins by recent momentum
-  and volatility, buys the best candidate each cycle. Checks exits
-  every 15 minutes. Take profit at 5%, recycle capital immediately.
+  Risk-adjusted crypto momentum. Z-score based scoring with volatility
+  and overextension penalties. Cost-adjusted. ATR-scaled exits.
+  No forced buys — holds cash when no signal clears threshold.
 
 instruments:
-  # Mix of large-cap and high-volatility altcoins.
-  # More coins = more chances for one to be moving hard.
+  # CORE TIER: liquid, established, tighter spreads
+  # SPECULATIVE TIER: higher vol, wider spreads, smaller allocation
   assets:
-    - symbol: BTC/USD     # Bitcoin — baseline, most liquid
-    - symbol: ETH/USD     # Ethereum — #2 by market cap
-    - symbol: SOL/USD     # Solana — high volatility L1
-    - symbol: DOGE/USD    # Dogecoin — meme coin, very volatile
-    - symbol: AVAX/USD    # Avalanche — volatile L1
-    - symbol: LINK/USD    # Chainlink — oracle play, swings hard
-    - symbol: DOT/USD     # Polkadot — volatile mid-cap
-    - symbol: SHIB/USD    # Shiba Inu — meme coin, huge swings
-    - symbol: PEPE/USD    # Pepe — meme coin, extreme volatility
-    - symbol: XRP/USD     # Ripple — news-driven volatility
+    - symbol: BTC/USD     # Core — most liquid crypto
+      tier: core
+    - symbol: ETH/USD     # Core — #2 by cap
+      tier: core
+    - symbol: SOL/USD     # Core — high-cap L1
+      tier: core
+    - symbol: XRP/USD     # Core — high liquidity
+      tier: core
+    - symbol: LINK/USD    # Core — oracle infrastructure
+      tier: core
+    - symbol: AVAX/USD    # Core — L1 with decent liquidity
+      tier: core
+    - symbol: DOT/USD     # Core — cross-chain
+      tier: core
+    - symbol: DOGE/USD    # Speculative — meme but liquid
+      tier: speculative
 
 allocation:
-  # $10 per buy cycle — goes to the highest-scoring coin
+  # $10 per buy cycle — only deployed if score > threshold
   dollars_per_cycle: 10.00
   min_trade_dollars: 10.00  # Alpaca crypto minimum order size
-
-  # Sleeve gets 30% of total capital allocation
   sleeve_pct: 0.30
 
-# ── Exit Rules ─────────────────────────────────────────────────────
-# Checked every 15 MINUTES — fast checks catch short-term moves.
+# ── Scoring Parameters ────────────────────────────────────────────
+scoring:
+  # Minimum score to trigger a buy. Below this → hold cash.
+  # Tuned so that ~40-60% of cycles produce a buy (not 100%).
+  min_score_threshold: 0.10
+
+  # Z-score momentum weights (must sum to 1.0)
+  weight_12h: 0.45      # Most recent momentum (proxied from daily)
+  weight_1d: 0.35       # 1-day return
+  weight_3d: 0.20       # 3-day trend
+
+  # Penalty weights (subtracted from momentum)
+  vol_penalty_weight: 0.35          # Higher vol = higher penalty
+  overextension_penalty_weight: 0.25  # Far above EMA = penalty
+
+  # Position penalty multiplier for already-held coins
+  position_penalty: 0.30
+
+  # EMA period for overextension calculation
+  ema_period: 20
+
+# ── Exit Rules — ATR-Scaled ───────────────────────────────────────
+# Exits adapt to each coin's volatility via ATR (Average True Range).
+# BTC (2% ATR) gets tighter stops than DOGE (5% ATR).
 exits:
+  atr_period: 14           # Lookback for ATR computation
+
   take_profit:
     enabled: true
-    target_pct: 0.05         # 5% — fast capture, recycle capital
+    atr_multiplier: 2.0    # Take profit at 2x ATR from entry
+    min_pct: 0.03          # Floor: never take profit below 3%
+    max_pct: 0.12          # Cap: don't wait for >12%
 
   trailing_stop:
     enabled: true
-    stop_pct: 0.04           # 4% drop from peak triggers sell
-    min_gain_to_activate: 0.02  # Arm after just 2% gain
+    atr_multiplier: 1.5    # Trail at 1.5x ATR from peak
+    activation_atr_mult: 1.0  # Arm after +1 ATR gain from entry
 
   hard_stop:
     enabled: true
-    stop_pct: 0.07           # 7% loss = cut it, move on
+    atr_multiplier: 1.25   # Stop at 1.25x ATR below entry
+    min_pct: 0.03          # Floor: never stop tighter than 3%
+    max_pct: 0.10          # Cap: never let a position lose >10%

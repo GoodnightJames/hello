@@ -210,9 +210,158 @@ def get_position_summary(session):
     }
 
 
+def compute_diagnostics(session, week_start, week_end):
+    """
+    Compute rich diagnostic metrics beyond basic P&L.
+
+    Includes:
+    - Sleeve NAV breakdown
+    - Realized volatility (20-day)
+    - Drawdown from peak
+    - Turnover ratio
+    - Hit rate by sleeve
+    - Fee/slippage drag estimate
+    - Current regime state
+    - Rejected signals summary
+    """
+    from capital.manager import get_sleeve_summary, get_trade_performance
+    from risk.sleeve_risk import (
+        _get_recent_equity_series,
+        compute_rolling_drawdown,
+        compute_rolling_volatility,
+        compute_turnover,
+    )
+    from risk.cost_model import estimate_round_trip_cost
+
+    diagnostics = {}
+
+    # Sleeve NAV breakdown
+    try:
+        sleeve_summary = get_sleeve_summary(session)
+        diagnostics["sleeves"] = sleeve_summary
+    except Exception:
+        diagnostics["sleeves"] = {}
+
+    # Realized vol and drawdown
+    try:
+        equity_series = _get_recent_equity_series(session, lookback_days=60)
+        dd, peak, trough = compute_rolling_drawdown(equity_series)
+        vol = compute_rolling_volatility(equity_series, window=20)
+        diagnostics["risk_metrics"] = {
+            "realized_vol_20d": round(vol, 4),
+            "max_drawdown_60d": round(dd, 4),
+            "peak_equity": round(peak, 2),
+            "trough_equity": round(trough, 2),
+        }
+    except Exception:
+        diagnostics["risk_metrics"] = {}
+
+    # Turnover
+    try:
+        turnover, total_traded, nav = compute_turnover(session, lookback_days=7)
+        diagnostics["turnover"] = {
+            "weekly_turnover_ratio": round(turnover, 4),
+            "total_traded": round(total_traded, 2),
+            "nav": round(nav, 2),
+        }
+    except Exception:
+        diagnostics["turnover"] = {}
+
+    # Hit rate by sleeve
+    try:
+        from data.db import Trade
+        cutoff = week_start
+        week_trades = (
+            session.query(Trade)
+            .filter(Trade.exit_date >= cutoff, Trade.exit_date <= week_end)
+            .all()
+        )
+        equity_trades = [t for t in week_trades if "/" not in t.symbol]
+        crypto_trades = [t for t in week_trades if "/" in t.symbol]
+
+        def _hit_rate(trades):
+            if not trades:
+                return {"trades": 0, "wins": 0, "losses": 0, "hit_rate": 0}
+            wins = sum(1 for t in trades if t.is_win)
+            return {
+                "trades": len(trades),
+                "wins": wins,
+                "losses": len(trades) - wins,
+                "hit_rate": round(wins / len(trades), 3) if trades else 0,
+                "total_pnl": round(sum(t.realized_pnl for t in trades), 2),
+                "avg_pnl": round(
+                    sum(t.realized_pnl for t in trades) / len(trades), 2
+                ) if trades else 0,
+            }
+
+        diagnostics["hit_rate_by_sleeve"] = {
+            "equity": _hit_rate(equity_trades),
+            "crypto": _hit_rate(crypto_trades),
+            "total": _hit_rate(week_trades),
+        }
+    except Exception:
+        diagnostics["hit_rate_by_sleeve"] = {}
+
+    # Estimated fee drag
+    try:
+        orders = (
+            session.query(Order)
+            .filter(
+                Order.status == "filled",
+                Order.filled_at >= week_start,
+                Order.filled_at <= week_end,
+            )
+            .all()
+        )
+        total_fee_estimate = 0.0
+        for o in orders:
+            notional = (o.filled_qty or 0) * (o.filled_price or 0)
+            is_crypto = "/" in o.symbol
+            # Rough one-way cost estimate
+            if is_crypto:
+                fee_bps = 25  # fee + spread estimate
+            else:
+                fee_bps = 2
+            total_fee_estimate += notional * fee_bps / 10000
+
+        diagnostics["estimated_fee_drag"] = {
+            "weekly_fees_estimate": round(total_fee_estimate, 2),
+            "orders_counted": len(orders),
+        }
+    except Exception:
+        diagnostics["estimated_fee_drag"] = {}
+
+    # Rejected signals
+    try:
+        decisions = (
+            session.query(Decision)
+            .filter(
+                Decision.date >= week_start,
+                Decision.date <= week_end,
+                Decision.action == "SKIP",
+            )
+            .all()
+        )
+        diagnostics["rejected_signals"] = {
+            "count": len(decisions),
+            "reasons": [
+                {"symbol": d.symbol, "reason": d.reason[:80]}
+                for d in decisions[:10]  # Top 10
+            ],
+        }
+    except Exception:
+        diagnostics["rejected_signals"] = {}
+
+    return diagnostics
+
+
 def generate_weekly_report(reference_date=None):
     """
-    Generate the full weekly report.
+    Generate the full weekly report with enhanced diagnostics.
+
+    Includes:
+    - Standard P&L, trades, decisions, risk events, positions
+    - NEW: sleeve NAV, vol, drawdown, turnover, hit rates, fee drag, rejected signals
 
     Args:
         reference_date: Date to generate report for (defaults to now).
@@ -238,6 +387,7 @@ def generate_weekly_report(reference_date=None):
             "decisions": get_decision_log(session, week_start, week_end),
             "risk_events": get_risk_events_log(session, week_start, week_end),
             "positions": get_position_summary(session),
+            "diagnostics": compute_diagnostics(session, week_start, week_end),
         }
 
         # Save as JSON
@@ -327,6 +477,57 @@ def _format_text_report(report):
         lines.append(f"  {e['created_at'][:10]}  [{e['severity']}]  {e['event_type']}")
     if not report["risk_events"]:
         lines.append("  (no risk events this week)")
+
+    # Diagnostics
+    diag = report.get("diagnostics", {})
+    if diag:
+        lines.append("")
+        lines.append("--- DIAGNOSTICS ---")
+
+        # Risk metrics
+        risk = diag.get("risk_metrics", {})
+        if risk:
+            lines.append(f"  Realized Vol (20d):  {risk.get('realized_vol_20d', 0):.1%}")
+            lines.append(f"  Max Drawdown (60d):  {risk.get('max_drawdown_60d', 0):.1%}")
+
+        # Turnover
+        turn = diag.get("turnover", {})
+        if turn:
+            lines.append(f"  Weekly Turnover:     {turn.get('weekly_turnover_ratio', 0):.2f}x")
+            lines.append(f"  Total Traded:        ${turn.get('total_traded', 0):,.2f}")
+
+        # Hit rate by sleeve
+        hr = diag.get("hit_rate_by_sleeve", {})
+        for sleeve_name in ("equity", "crypto", "total"):
+            s = hr.get(sleeve_name, {})
+            if s.get("trades", 0) > 0:
+                lines.append(
+                    f"  {sleeve_name.title()} Hit Rate: "
+                    f"{s['wins']}/{s['trades']} ({s.get('hit_rate', 0):.0%}) "
+                    f"P&L: ${s.get('total_pnl', 0):+.2f}"
+                )
+
+        # Fee drag
+        fees = diag.get("estimated_fee_drag", {})
+        if fees:
+            lines.append(f"  Est. Fee Drag:       ${fees.get('weekly_fees_estimate', 0):.2f}")
+
+        # Sleeve balances
+        sleeves = diag.get("sleeves", {})
+        for name, data in sleeves.items():
+            if isinstance(data, dict):
+                lines.append(
+                    f"  Sleeve [{name}]:  cash=${data.get('cash', 0):.2f}  "
+                    f"deposited=${data.get('total_deposited', 0):.2f}  "
+                    f"spent=${data.get('total_spent', 0):.2f}"
+                )
+
+        # Rejected signals
+        rej = diag.get("rejected_signals", {})
+        if rej.get("count", 0) > 0:
+            lines.append(f"  Rejected Signals:    {rej['count']}")
+            for r in rej.get("reasons", [])[:3]:
+                lines.append(f"    {r['symbol']}: {r['reason'][:60]}")
 
     lines.append("")
     lines.append("=" * 60)
