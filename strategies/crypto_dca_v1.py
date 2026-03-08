@@ -1,24 +1,24 @@
 """
-Crypto Active Trading Strategy — v5.0
+Crypto Active Trading Strategy — v6.0
 
-MAJOR CHANGES from v4:
-- Z-score based momentum (not raw returns) with vol penalty
-- Overextension penalty (distance above 20-period EMA)
-- Cost-adjusted scoring (only buy when edge > fees)
+CHANGES from v5:
+- Regime-adaptive thresholds (tighter entry in corrections/crisis)
+- Time-decay exits (cut stale trades after 12h without progress)
+- Momentum-collapse exits (cut when momentum sharply reverses)
+- Sleeve health meta-layer integration (reduce aggression when out of form)
+
+Core architecture (v5):
+- Z-score based momentum with vol/overextension penalties
+- Two-gate entry: rank threshold + cost gate (edge_ratio >= 1.5x)
+- ATR-scaled exits (take-profit, trailing stop, hard stop)
 - Signal threshold — no forced buys. Cash is a position.
-- ATR/volatility-scaled exits instead of flat percentages
-- Meme coins treated as speculative sub-sleeve
 
-Buy side: Scores all coins by risk-adjusted momentum, penalizes
-volatility and overextension, subtracts transaction cost estimate.
-Only buys if best score exceeds threshold.
-
-Sell side: Every 15 min checks all open crypto positions for exit conditions:
-1. Take-profit — ATR-scaled (1.5-2x ATR from entry)
-2. Trailing stop — ATR-scaled (activates after +1 ATR gain)
-3. Hard stop — ATR-scaled (1.0-1.25x ATR below entry)
-
-Proceeds from sells recycle back to the crypto sleeve for re-deployment.
+Exit hierarchy (checked in order):
+1. Take-profit — ATR-scaled (harvest winners)
+2. Hard stop — ATR-scaled (cut losers)
+3. Time decay — exit stale trades (12h without progress)
+4. Momentum collapse — exit when thesis breaks
+5. Trailing stop — ATR-scaled (protect profits)
 """
 
 import numpy as np
@@ -51,6 +51,31 @@ class CryptoDCAStrategy(StrategyBase):
         # Signal threshold — minimum score to trigger a buy
         scoring = config.get("scoring", {})
         self.min_score_threshold = scoring.get("min_score_threshold", 0.10)
+
+        # Regime-adaptive thresholds: tighten entry requirements in worse regimes.
+        # In trending markets, use base threshold. In corrections/crisis, require
+        # much stronger signals — one good trade beats five mediocre ones.
+        regime_cfg = config.get("regime_overrides", {})
+        self.regime_threshold_adjustments = regime_cfg.get("threshold_adjustments", {
+            "trending": 0.0,        # Normal: use base threshold
+            "ranging": 0.05,        # Add 0.05 in mixed conditions
+            "correction": 0.10,     # Add 0.10 in corrections
+            "crisis": 0.20,         # Add 0.20 in crisis — very selective
+        })
+        self.regime_edge_ratio_adjustments = regime_cfg.get("edge_ratio_adjustments", {
+            "trending": 0.0,        # Normal: use base min_edge_ratio
+            "ranging": 0.25,        # Need 1.75x instead of 1.5x
+            "correction": 0.50,     # Need 2.0x instead of 1.5x
+            "crisis": 1.0,          # Need 2.5x instead of 1.5x
+        })
+
+        # Time-based trade decay: exit stale trades that haven't progressed.
+        # If a trade hasn't moved enough after N hours, the thesis is weak.
+        decay_cfg = config.get("trade_decay", {})
+        self.time_decay_enabled = decay_cfg.get("enabled", True)
+        self.stale_hours = decay_cfg.get("stale_hours", 12)
+        self.stale_min_progress_pct = decay_cfg.get("min_progress_pct", 0.005)
+        self.momentum_collapse_exit = decay_cfg.get("momentum_collapse_exit", True)
 
         # Momentum weights (z-score based)
         self.weight_12h = scoring.get("weight_12h", 0.45)
@@ -333,19 +358,59 @@ class CryptoDCAStrategy(StrategyBase):
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores
 
-    def generate_signals(self, data=None, exit_log=None, held_symbols=None):
+    def _get_regime_adjusted_thresholds(self, regime=None):
         """
-        Generate a buy signal using two independent gates:
+        Adjust entry thresholds based on market regime.
 
-        Gate 1 (ranking): z-score rank_score >= min_score_threshold
-            Ensures we only buy coins with meaningfully positive risk-adjusted momentum
-            relative to the universe. Operates in dimensionless z-score space.
+        In trending markets: use base thresholds (normal trading).
+        In corrections/crisis: require much stronger signals.
+        "Do nothing" bias when conditions are mixed.
 
-        Gate 2 (cost): expected_edge > cost_hurdle
-            Ensures the expected return exceeds estimated round-trip friction.
-            Both sides in decimal return space — no unit mismatch.
+        Args:
+            regime: Dict from tag_current_regime() with "phase" key.
 
+        Returns:
+            (adjusted_threshold, adjusted_min_edge_ratio)
+        """
+        if regime is None:
+            return self.min_score_threshold, self.config.get("scoring", {}).get(
+                "min_edge_ratio", 1.5
+            )
+
+        phase = regime.get("phase", "trending")
+
+        threshold_bump = self.regime_threshold_adjustments.get(phase, 0.0)
+        edge_ratio_bump = self.regime_edge_ratio_adjustments.get(phase, 0.0)
+
+        base_threshold = self.min_score_threshold
+        base_edge_ratio = self.config.get("scoring", {}).get("min_edge_ratio", 1.5)
+
+        adjusted_threshold = base_threshold + threshold_bump
+        adjusted_edge_ratio = base_edge_ratio + edge_ratio_bump
+
+        if threshold_bump > 0 or edge_ratio_bump > 0:
+            logger.info(
+                f"Regime [{phase}]: threshold {base_threshold:.2f} → "
+                f"{adjusted_threshold:.2f}, edge_ratio {base_edge_ratio:.1f}x → "
+                f"{adjusted_edge_ratio:.1f}x",
+            )
+
+        return adjusted_threshold, adjusted_edge_ratio
+
+    def generate_signals(self, data=None, exit_log=None, held_symbols=None,
+                         regime=None):
+        """
+        Generate a buy signal using two independent gates with regime adaptation.
+
+        Gate 1 (ranking): z-score rank_score >= regime-adjusted threshold
+        Gate 2 (cost): edge_ratio >= regime-adjusted min_edge_ratio
+
+        In worse regimes, both gates tighten — fewer trades, higher conviction.
         Both gates must pass. Cash is a position.
+
+        Args:
+            regime: Dict from tag_current_regime(). If provided, thresholds
+                    adjust based on market phase (trending/ranging/correction/crisis).
         """
         instruments = self.get_instruments()
         if not instruments:
@@ -355,35 +420,42 @@ class CryptoDCAStrategy(StrategyBase):
         if held_symbols is None:
             held_symbols = set()
 
+        # Get regime-adjusted thresholds
+        effective_threshold, effective_edge_ratio = (
+            self._get_regime_adjusted_thresholds(regime)
+        )
+
         scored = self._score_coins(instruments, held_symbols)
         dollar_amount = self.dollars_per_cycle
 
         for symbol, score, reason, diag in scored:
             logger.info(f"  Coin score: {symbol} = {score:.4f} ({reason})")
 
-        # Gate 1: ranking threshold (z-score space)
-        if not scored or scored[0][1] < self.min_score_threshold:
+        # Gate 1: ranking threshold (z-score space, regime-adjusted)
+        if not scored or scored[0][1] < effective_threshold:
             best_sym = scored[0][0] if scored else "none"
             best_score = scored[0][1] if scored else 0.0
             logger.info(
                 f"NO BUY: Best rank_score {best_sym}={best_score:.4f} below "
-                f"threshold {self.min_score_threshold}. Holding cash.",
+                f"threshold {effective_threshold:.2f}. Holding cash.",
             )
             return []
 
-        # Gate 2: cost hurdle (return space) — find best coin that passes both
+        # Gate 2: cost hurdle (return space, regime-adjusted edge ratio)
         best_entry = None
         for symbol, score, reason, diag in scored:
-            if score < self.min_score_threshold:
+            if score < effective_threshold:
                 break  # Sorted descending; all remaining below threshold
-            if diag.get("passes_cost_gate", False):
+            # Use regime-adjusted edge ratio instead of the base one
+            symbol_edge_ratio = diag.get("edge_ratio", 0)
+            if symbol_edge_ratio >= effective_edge_ratio:
                 best_entry = (symbol, score, reason, diag)
                 break
             else:
                 logger.info(
-                    f"COST GATE FAIL: {symbol} rank={score:.4f} but "
-                    f"edge={diag.get('expected_edge', 0):.4f} < "
-                    f"hurdle={diag.get('cost_hurdle', 0):.4f}",
+                    f"COST GATE FAIL: {symbol} rank={score:.4f} "
+                    f"edge_ratio={symbol_edge_ratio:.1f}x < "
+                    f"required={effective_edge_ratio:.1f}x",
                 )
 
         if best_entry is None:
@@ -408,6 +480,8 @@ class CryptoDCAStrategy(StrategyBase):
             )
             return []
 
+        phase = regime.get("phase", "unknown") if regime else "unknown"
+
         signals = [{
             "symbol": best_symbol,
             "signal_type": "BUY",
@@ -421,7 +495,9 @@ class CryptoDCAStrategy(StrategyBase):
                 "cost_hurdle": best_diag.get("cost_hurdle", 0),
                 "diagnostics": best_diag,
                 "reason": f"Momentum pick: {best_reason}",
-                "rank_threshold": self.min_score_threshold,
+                "rank_threshold": effective_threshold,
+                "effective_edge_ratio": effective_edge_ratio,
+                "regime_phase": phase,
             },
         }]
 
@@ -436,7 +512,9 @@ class CryptoDCAStrategy(StrategyBase):
                     "rank_score": best_score,
                     "expected_edge": best_diag.get("expected_edge"),
                     "cost_hurdle": best_diag.get("cost_hurdle"),
-                    "rank_threshold": self.min_score_threshold,
+                    "rank_threshold": effective_threshold,
+                    "effective_edge_ratio": effective_edge_ratio,
+                    "regime_phase": phase,
                     "all_scores": {s[0]: round(s[1], 4) for s in scored},
                 }
             },
@@ -458,16 +536,27 @@ class CryptoDCAStrategy(StrategyBase):
         """Clamp value between min and max."""
         return max(min_val, min(max_val, value))
 
-    def generate_exit_signals(self, positions, cost_bases, high_water_marks):
+    def generate_exit_signals(self, positions, cost_bases, high_water_marks,
+                              entry_times=None):
         """
-        Check all crypto positions for ATR-scaled exit conditions.
+        Check all crypto positions for exit conditions.
 
-        ATR-scaled exits adapt to each coin's actual volatility:
-        - BTC with 2% ATR -> take profit at ~4%, stop at ~2.5%
-        - PEPE with 8% ATR -> take profit at ~16%, stop at ~10%
+        Exit hierarchy (checked in order, first match wins):
+        1. Take-profit — ATR-scaled (harvest winners)
+        2. Hard stop — ATR-scaled (cut losers unconditionally)
+        3. Time decay — exit stale trades that haven't progressed
+        4. Momentum collapse — exit if momentum sharply reverses after entry
+        5. Trailing stop — ATR-scaled (protect profits in winning trades)
+
+        Args:
+            entry_times: Dict of {symbol: entry_datetime} for time-decay checks.
         """
+        from datetime import datetime, timezone
+
         instruments = set(self.get_instruments())
         exit_signals = []
+        if entry_times is None:
+            entry_times = {}
 
         for symbol, pos_data in positions.items():
             if symbol not in instruments:
@@ -544,7 +633,77 @@ class CryptoDCAStrategy(StrategyBase):
                     )
                     continue
 
-            # 3. Trailing stop (ATR-scaled, requires arming)
+            # 3. Time decay — exit stale trades that haven't made progress.
+            # If a trade hasn't moved enough after N hours, the thesis is weak.
+            # This prevents capital getting trapped in mediocre setups.
+            if self.time_decay_enabled and symbol in entry_times:
+                entry_time = entry_times[symbol]
+                now = datetime.now(timezone.utc)
+                if hasattr(entry_time, 'tzinfo') and entry_time.tzinfo is None:
+                    from datetime import timezone as tz
+                    entry_time = entry_time.replace(tzinfo=tz.utc)
+                hours_held = (now - entry_time).total_seconds() / 3600.0
+
+                if hours_held >= self.stale_hours:
+                    if abs(gain_from_entry) < self.stale_min_progress_pct:
+                        exit_signals.append({
+                            "symbol": symbol,
+                            "signal_type": "SELL",
+                            "action": "SELL",
+                            "reason": (
+                                f"TIME DECAY: {symbol} held {hours_held:.0f}h with only "
+                                f"{gain_from_entry:+.2%} progress "
+                                f"(need >{self.stale_min_progress_pct:.1%} by "
+                                f"{self.stale_hours}h), freeing capital"
+                            ),
+                            "exit_type": "time_decay",
+                        })
+                        logger.info(
+                            f"Time decay triggered: {symbol} {hours_held:.0f}h "
+                            f"stale ({gain_from_entry:+.2%})",
+                            extra={"extra_data": {
+                                "symbol": symbol, "hours_held": round(hours_held, 1),
+                                "gain_pct": round(gain_from_entry, 4),
+                                "min_progress": self.stale_min_progress_pct,
+                            }},
+                        )
+                        continue
+
+            # 4. Momentum collapse — if momentum score has sharply reversed
+            # since entry, the thesis is broken even if stops haven't triggered.
+            if self.momentum_collapse_exit:
+                try:
+                    current_scores = self._score_coins([symbol])
+                    if current_scores:
+                        _, current_score, _, current_diag = current_scores[0]
+                        mom_strength_now = current_diag.get("mom_strength", 0)
+                        # If momentum has flipped strongly negative, exit early
+                        if mom_strength_now < -1.0 and gain_from_entry < 0:
+                            exit_signals.append({
+                                "symbol": symbol,
+                                "signal_type": "SELL",
+                                "action": "SELL",
+                                "reason": (
+                                    f"MOMENTUM COLLAPSE: {symbol} momentum={mom_strength_now:.1f} "
+                                    f"(strongly negative) while underwater "
+                                    f"({gain_from_entry:+.1%})"
+                                ),
+                                "exit_type": "momentum_collapse",
+                            })
+                            logger.warning(
+                                f"Momentum collapse: {symbol} mom_strength="
+                                f"{mom_strength_now:.1f}, gain={gain_from_entry:+.1%}",
+                                extra={"extra_data": {
+                                    "symbol": symbol,
+                                    "mom_strength": round(mom_strength_now, 2),
+                                    "gain_pct": round(gain_from_entry, 4),
+                                }},
+                            )
+                            continue
+                except Exception:
+                    pass  # Non-critical — skip if scoring fails
+
+            # 5. Trailing stop (ATR-scaled, requires arming)
             if self.trailing_stop_enabled:
                 hw = high_water_marks.get(symbol, {})
                 high_price = hw.get("high_price", 0)

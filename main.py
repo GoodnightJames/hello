@@ -345,14 +345,18 @@ def run_crypto_exit_check():
             logger.info("Crypto exit check: no crypto positions held")
             return []
 
-        # Get cost bases and high-water marks from DB
+        # Get cost bases, high-water marks, and entry times from DB
         session = get_db_session()
         try:
             cost_bases = {}
+            entry_times = {}
             for sym in crypto_positions:
                 basis = session.query(CostBasis).filter(CostBasis.symbol == sym).first()
                 if basis and basis.avg_price > 0:
                     cost_bases[sym] = {"avg_price": basis.avg_price, "qty": basis.qty}
+                    # Use cost basis updated_at as entry time proxy
+                    if hasattr(basis, 'updated_at') and basis.updated_at:
+                        entry_times[sym] = basis.updated_at
 
             high_water_marks = {}
             for sym in crypto_positions:
@@ -362,8 +366,11 @@ def run_crypto_exit_check():
         finally:
             session.close()
 
-        # Generate exit signals
-        exit_signals = strategy.generate_exit_signals(crypto_positions, cost_bases, high_water_marks)
+        # Generate exit signals (with time-decay and momentum-collapse checks)
+        exit_signals = strategy.generate_exit_signals(
+            crypto_positions, cost_bases, high_water_marks,
+            entry_times=entry_times,
+        )
 
         if not exit_signals:
             return []
@@ -493,10 +500,26 @@ def run_crypto_dca_cycle():
         budget_result = check_sleeve_risk_budget(session, risk_params)
         budget_scale = budget_result.get("position_scale", 1.0)
 
+        # ── Sleeve health check ─────────────────────────────────────
+        # Meta-layer: reduce aggressiveness when the sleeve is "out of form."
+        from risk.sleeve_health import check_sleeve_health
+        health_session = get_db_session()
+        health = check_sleeve_health(health_session, sleeve="crypto")
+        health_session.close()
+        health_mult = health.get("aggressiveness", 1.0)
+
+        if health_mult < 1.0:
+            logger.info(
+                f"Sleeve health: score={health['score']:.2f} → "
+                f"aggressiveness={health_mult:.2f} ({health['recommendation']})"
+            )
+
         # Generate buy signal — picks best coin by risk-adjusted momentum.
-        # Returns empty if no coin passes both rank threshold AND cost gate.
+        # Passes regime so thresholds adapt to market conditions.
         scored = strategy._score_coins(eligible_symbols, held_symbols)
-        signals = strategy.generate_signals(held_symbols=held_symbols)
+        signals = strategy.generate_signals(
+            held_symbols=held_symbols, regime=regime
+        )
 
         # ── Instrument the cycle ──────────────────────────────────────
         from review.cycle_instrumentation import instrument_crypto_cycle

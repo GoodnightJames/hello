@@ -24,12 +24,12 @@
 #   edge_ratio    = expected_edge / cost_hurdle
 #   → Gate 2: edge_ratio >= min_edge_ratio (1.5)
 
-version: "5.0.0"
+version: "6.0.0"
 name: crypto_active
 description: >
-  Risk-adjusted crypto momentum. Z-score based scoring with volatility
-  and overextension penalties. Cost-adjusted. ATR-scaled exits.
-  No forced buys — holds cash when no signal clears threshold.
+  Risk-adjusted crypto momentum with regime-adaptive thresholds,
+  time-decay exits, momentum-collapse detection, and sleeve health
+  meta-layer. Trades fewer, higher-conviction setups.
 
 instruments:
   # CORE TIER: liquid, established, tighter spreads
@@ -108,3 +108,27 @@ exits:
     atr_multiplier: 1.25   # Stop at 1.25x ATR below entry
     min_pct: 0.03          # Floor: never stop tighter than 3%
     max_pct: 0.10          # Cap: never let a position lose >10%
+
+# ── Regime-Adaptive Thresholds ──────────────────────────────────
+# In worse market phases, require stronger signals.
+# "Do nothing" bias when conditions are mixed.
+regime_overrides:
+  threshold_adjustments:
+    trending: 0.0           # Normal: use base threshold (0.10)
+    ranging: 0.05           # Need 0.15 rank score in mixed markets
+    correction: 0.10        # Need 0.20 rank score in corrections
+    crisis: 0.20            # Need 0.30 rank score in crisis
+  edge_ratio_adjustments:
+    trending: 0.0           # Normal: need 1.5x cost
+    ranging: 0.25           # Need 1.75x cost in mixed markets
+    correction: 0.50        # Need 2.0x cost in corrections
+    crisis: 1.0             # Need 2.5x cost in crisis
+
+# ── Time-Based Trade Decay ──────────────────────────────────────
+# Exit stale trades that haven't made meaningful progress.
+# Prevents capital getting trapped in mediocre setups.
+trade_decay:
+  enabled: true
+  stale_hours: 12           # After 12 hours with no progress...
+  min_progress_pct: 0.005   # ...need at least 0.5% gain to stay
+  momentum_collapse_exit: true  # Exit if momentum flips strongly negative
