@@ -539,9 +539,11 @@ def run_crypto_dca_cycle():
 
         # Generate buy signal — picks best coin by risk-adjusted momentum.
         # Passes regime so thresholds adapt to market conditions.
+        # Pass eligible_symbols so generate_signals respects universe + policy filters.
         scored = strategy._score_coins(eligible_symbols, held_symbols)
         signals = strategy.generate_signals(
-            held_symbols=held_symbols, regime=regime
+            held_symbols=held_symbols, regime=regime,
+            instruments=eligible_symbols,
         )
 
         # ── Shadow mode: score blocked symbols hypothetically ─────────

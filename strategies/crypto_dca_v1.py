@@ -183,6 +183,7 @@ class CryptoDCAStrategy(StrategyBase):
         returns_12h = {}
         returns_1d = {}
         returns_3d = {}
+        returns_7d = {}
         volatilities = {}
         overextensions = {}
         atrs = {}
@@ -206,6 +207,12 @@ class CryptoDCAStrategy(StrategyBase):
             else:
                 ret_3d = ret_1d
             returns_3d[symbol] = ret_3d
+
+            if len(col) >= 8:
+                ret_7d = (col.iloc[-1] - col.iloc[-8]) / col.iloc[-8]
+            else:
+                ret_7d = ret_3d
+            returns_7d[symbol] = ret_7d
 
             recent = col.tail(min(8, len(col)))
             daily_changes = recent.pct_change().dropna().abs()
@@ -268,19 +275,28 @@ class CryptoDCAStrategy(StrategyBase):
             vol_for_cost = volatilities.get(symbol, 0.02)
             atr_pct = atrs.get(symbol, 0.03)
 
-            # Annualize 1d return for direction, normalize by vol to get
-            # momentum strength in "number of daily vol moves" — a dimensionless
-            # signal that converts cleanly to expected forward return.
+            # Momentum strength: vol-normalized returns across timeframes.
+            # Blends 1d, 3d, and 7d to avoid a single red day zeroing
+            # everything. Longer lookbacks provide trend stability while
+            # shorter ones provide responsiveness.
             ret_1d_sym = returns_1d.get(symbol, 0)
             ret_3d_sym = returns_3d.get(symbol, 0)
+            ret_7d_sym = returns_7d.get(symbol, 0)
             daily_vol = volatilities.get(symbol, 0.02)
 
             if daily_vol > 1e-6:
-                # Momentum strength: how many daily vol units is the move?
-                # Blends 1d and 3d (3d annualized to daily) for stability.
+                # Normalize each timeframe to per-day return, then to vol units
                 mom_strength_1d = ret_1d_sym / daily_vol
-                mom_strength_3d = (ret_3d_sym / 3.0) / daily_vol  # Per-day 3d return
-                mom_strength = 0.6 * mom_strength_1d + 0.4 * mom_strength_3d
+                mom_strength_3d = (ret_3d_sym / 3.0) / daily_vol
+                mom_strength_7d = (ret_7d_sym / 7.0) / daily_vol
+                # Blend: 1d reacts fast, 7d provides trend anchor.
+                # If 7d is positive but 1d is negative (pullback in uptrend),
+                # mom_strength stays positive — we still have an edge estimate.
+                mom_strength = (
+                    0.35 * mom_strength_1d
+                    + 0.35 * mom_strength_3d
+                    + 0.30 * mom_strength_7d
+                )
             else:
                 mom_strength = 0.0
 
@@ -343,6 +359,8 @@ class CryptoDCAStrategy(StrategyBase):
                 "stop_clamped": round(stop_clamped, 4),
                 "stop_was_clamped": stop_was_clamped,
                 "ret_1d": round(ret_1d_sym, 4),
+                "ret_3d": round(ret_3d_sym, 4),
+                "ret_7d": round(ret_7d_sym, 4),
                 "vol": round(daily_vol, 4),
             }
 
@@ -398,7 +416,7 @@ class CryptoDCAStrategy(StrategyBase):
         return adjusted_threshold, adjusted_edge_ratio
 
     def generate_signals(self, data=None, exit_log=None, held_symbols=None,
-                         regime=None):
+                         regime=None, instruments=None):
         """
         Generate a buy signal using two independent gates with regime adaptation.
 
@@ -411,8 +429,11 @@ class CryptoDCAStrategy(StrategyBase):
         Args:
             regime: Dict from tag_current_regime(). If provided, thresholds
                     adjust based on market phase (trending/ranging/correction/crisis).
+            instruments: Optional filtered instrument list. If not provided,
+                        uses full configured universe (legacy behavior).
         """
-        instruments = self.get_instruments()
+        if instruments is None:
+            instruments = self.get_instruments()
         if not instruments:
             logger.warning("No instruments configured for crypto strategy")
             return []
