@@ -11,11 +11,18 @@
 # 7. Cleaner universe — core + speculative tiers
 #
 # SCORING FORMULA:
+#   Gate 1 (ranking): z-score momentum + penalties > threshold
+#   Gate 2 (cost):    expected_edge / cost_hurdle >= min_edge_ratio
+#   Both gates must pass to trigger a buy.
+#
 #   momentum   = 0.45*z(12h) + 0.35*z(1d) + 0.20*z(3d)
 #   penalties  = -0.35*z(realized_vol) - 0.25*z(dist_above_ema20)
 #   raw_score  = momentum + penalties
-#   final      = raw_score - round_trip_cost_estimate
-#   → Buy ONLY if final > threshold (0.10)
+#   → Gate 1: raw_score > min_score_threshold (0.10)
+#
+#   expected_edge = mom_strength * atr_pct * continuation_fraction
+#   edge_ratio    = expected_edge / cost_hurdle
+#   → Gate 2: edge_ratio >= min_edge_ratio (1.5)
 
 version: "5.0.0"
 name: crypto_active
@@ -71,6 +78,13 @@ scoring:
 
   # EMA period for overextension calculation
   ema_period: 20
+
+  # Cost gate: ATR-calibrated momentum continuation
+  # mom_strength = vol-normalized momentum (how many daily-vol units is the move)
+  # expected_edge = mom_strength * atr_pct * continuation_fraction
+  # Must clear cost_hurdle by this multiple to trigger a buy
+  continuation_fraction: 0.30   # Conservative: expect to capture 30% of momentum move
+  min_edge_ratio: 1.5           # Need 1.5x cost to justify the trade
 
 # ── Exit Rules — ATR-Scaled ───────────────────────────────────────
 # Exits adapt to each coin's volatility via ATR (Average True Range).

@@ -225,19 +225,61 @@ class CryptoDCAStrategy(StrategyBase):
             else:
                 held_flag = ""
 
-            # ENTRY GATE: expected edge vs cost, both in return space (decimals)
-            # Expected short-term edge = weighted average of raw returns
-            expected_edge = (
-                self.weight_12h * returns_12h.get(symbol, 0)
-                + self.weight_1d * returns_1d.get(symbol, 0)
-                + self.weight_3d * returns_3d.get(symbol, 0)
-            )
+            # ENTRY GATE: expected forward edge vs cost, both in return space.
+            #
+            # Why not just use raw past returns as expected edge:
+            # 1. ret_12h is ret_1d*0.6 — double-counts the same data
+            # 2. Raw returns treat "BTC went up 3% today" as "I expect 3% forward"
+            # 3. Mixes time horizons (1d vs 3d) without normalization
+            #
+            # Better approach: ATR-calibrated momentum continuation estimate.
+            # If momentum is positive and coin is not overextended, estimate
+            # a conservative forward move as a fraction of ATR — which is in
+            # the same return-space units as the cost hurdle.
+            #
+            # expected_forward = momentum_direction * atr * continuation_fraction
+            # where continuation_fraction reflects how much of one ATR move
+            # we conservatively expect to capture in the next holding period.
             vol_for_cost = volatilities.get(symbol, 0.02)
-            cost_hurdle = compute_cost_hurdle(symbol, volatility=vol_for_cost)
-            passes_cost_gate = expected_edge > cost_hurdle
+            atr_pct = atrs.get(symbol, 0.03)
+
+            # Annualize 1d return for direction, normalize by vol to get
+            # momentum strength in "number of daily vol moves" — a dimensionless
+            # signal that converts cleanly to expected forward return.
+            ret_1d_sym = returns_1d.get(symbol, 0)
+            ret_3d_sym = returns_3d.get(symbol, 0)
+            daily_vol = volatilities.get(symbol, 0.02)
+
+            if daily_vol > 1e-6:
+                # Momentum strength: how many daily vol units is the move?
+                # Blends 1d and 3d (3d annualized to daily) for stability.
+                mom_strength_1d = ret_1d_sym / daily_vol
+                mom_strength_3d = (ret_3d_sym / 3.0) / daily_vol  # Per-day 3d return
+                mom_strength = 0.6 * mom_strength_1d + 0.4 * mom_strength_3d
+            else:
+                mom_strength = 0.0
+
+            # Expected forward move: momentum_strength * ATR * continuation_frac.
+            # continuation_fraction = 0.3 is conservative: we expect to capture
+            # ~30% of an ATR move in the next holding period. This is deliberately
+            # pessimistic — if a strategy can't clear costs at 30% capture, it
+            # shouldn't be trading.
+            continuation_fraction = self.config.get("scoring", {}).get(
+                "continuation_fraction", 0.30
+            )
+            expected_edge = max(0.0, mom_strength * atr_pct * continuation_fraction)
+
+            cost_hurdle_val = compute_cost_hurdle(symbol, volatility=vol_for_cost)
+
+            # Require edge_ratio >= min_edge_ratio (default 1.5x cost).
+            # A tiny edge above cost is not robust enough for live execution.
+            min_edge_ratio = self.config.get("scoring", {}).get(
+                "min_edge_ratio", 1.5
+            )
+            edge_ratio = (expected_edge / cost_hurdle_val) if cost_hurdle_val > 0 else 0.0
+            passes_cost_gate = edge_ratio >= min_edge_ratio
 
             # ATR clamp diagnostics — check if clamps are dominating
-            atr_pct = atrs.get(symbol, 0.03)
             tp_raw = atr_pct * self.take_profit_atr_mult
             tp_clamped = self._clamp(tp_raw, self.take_profit_min_pct, self.take_profit_max_pct)
             tp_was_clamped = abs(tp_raw - tp_clamped) > 1e-6
@@ -260,9 +302,13 @@ class CryptoDCAStrategy(StrategyBase):
                 "vol_penalty": round(vol_pen, 4),
                 "ext_penalty": round(ext_pen, 4),
                 "rank_score": round(rank_score, 4),
+                "mom_strength": round(mom_strength, 4),
                 "expected_edge": round(expected_edge, 6),
-                "cost_hurdle": round(cost_hurdle, 6),
+                "cost_hurdle": round(cost_hurdle_val, 6),
+                "edge_ratio": round(edge_ratio, 3),
+                "min_edge_ratio": min_edge_ratio,
                 "passes_cost_gate": passes_cost_gate,
+                "continuation_fraction": continuation_fraction,
                 "cost_bps": cost_info["total_bps"],
                 "atr_pct": round(atr_pct, 4),
                 "tp_raw": round(tp_raw, 4),
@@ -271,13 +317,14 @@ class CryptoDCAStrategy(StrategyBase):
                 "stop_raw": round(stop_raw, 4),
                 "stop_clamped": round(stop_clamped, 4),
                 "stop_was_clamped": stop_was_clamped,
-                "ret_1d": round(returns_1d.get(symbol, 0), 4),
-                "vol": round(volatilities.get(symbol, 0), 4),
+                "ret_1d": round(ret_1d_sym, 4),
+                "vol": round(daily_vol, 4),
             }
 
             reason = (
-                f"rank={rank_score:+.3f} edge={expected_edge:+.4f} "
-                f"hurdle={cost_hurdle:.4f} cost={cost_info['total_bps']:.0f}bps"
+                f"rank={rank_score:+.3f} edge={expected_edge:.4f} "
+                f"hurdle={cost_hurdle_val:.4f} ratio={edge_ratio:.1f}x "
+                f"cost={cost_info['total_bps']:.0f}bps"
                 f"{' COST_FAIL' if not passes_cost_gate else ''}{held_flag}"
             )
 
