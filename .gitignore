@@ -19,9 +19,8 @@ build/
 logs/*.json
 logs/*.log
 
-# Reports (generated weekly)
-reports/*.json
-reports/*.txt
+# Reports (runtime artifacts)
+reports/
 
 # IDE
 .vscode/
